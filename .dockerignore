@@ -1,8 +1,7 @@
 data/
+.git/
 .idea/
 .ipynb_checkpoints/
 __pycache__/
 *.pyc
-spark-warehouse/
-metastore_db/
-derby.log
+notebooks/
