@@ -1,0 +1,7 @@
+data/
+.git/
+.idea/
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+notebooks/
