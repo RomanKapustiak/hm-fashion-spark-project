@@ -1,0 +1,36 @@
+services:
+  # Mode 1: Run PySpark scripts (e.g. main.py)
+  #   docker compose run spark-app
+  #   docker compose run spark-app python my_other_script.py
+  spark-app:
+    build: .
+    container_name: hm-spark-app
+    volumes:
+      - ./data:/app/data
+      - ./src:/app/src
+    environment:
+      - SPARK_LOCAL_DIRS=/tmp/spark
+
+  # Mode 2: Interactive Jupyter Notebook / Lab
+  #   docker compose up notebook
+  #   Then open http://localhost:8888
+  notebook:
+    build: .
+    container_name: hm-spark-notebook
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./data:/app/data
+      - ./notebooks:/app/notebooks
+      - ./src:/app/src
+    environment:
+      - SPARK_LOCAL_DIRS=/tmp/spark
+    command: >
+      jupyter lab
+      --ip=0.0.0.0
+      --port=8888
+      --no-browser
+      --allow-root
+      --NotebookApp.token=''
+      --NotebookApp.password=''
+      --notebook-dir=/app/src
