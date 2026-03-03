@@ -6,7 +6,8 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-ENV JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
+RUN ln -s /usr/lib/jvm/java-11-openjdk-* /usr/lib/jvm/java-11-openjdk
+ENV JAVA_HOME=/usr/lib/jvm/java-11-openjdk
 
 ARG PYSPARK_VERSION=3.2.0
 RUN pip --no-cache-dir install pyspark==${PYSPARK_VERSION}

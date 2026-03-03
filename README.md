@@ -12,7 +12,11 @@ To analyze customer behavior and product trends using PySpark, implementing a fu
 * **transactions_train.csv**: Purchase history (date, price, channel).
 
 ## Prerequisites
-* [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running.
+* **Docker Desktop** installed and running:
+  * Windows: [Download for Windows](https://docs.docker.com/desktop/setup/install/windows-install/)
+  * macOS: [Download for Mac](https://docs.docker.com/desktop/setup/install/mac-install/)
+
+> **Note:** All `docker compose` commands in this guide work identically on Windows (PowerShell / CMD) and macOS (Terminal / zsh).
 
 ## Quick Start
 
