@@ -8,6 +8,8 @@ services:
     volumes:
       - ./data:/app/data
       - ./src:/app/src
+      - ./tests:/app/tests
+      - ./main.py:/app/main.py
     environment:
       - SPARK_LOCAL_DIRS=/tmp/spark
 
