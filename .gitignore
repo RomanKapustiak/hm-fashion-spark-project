@@ -1,8 +1,12 @@
 data/
+output/
 .idea/
+.venv/
+.pytest_cache/
 .ipynb_checkpoints/
 __pycache__/
 *.pyc
+.DS_Store
 spark-warehouse/
 metastore_db/
 derby.log

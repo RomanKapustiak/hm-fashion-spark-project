@@ -38,6 +38,38 @@ This builds once. Rebuild only when you change `Dockerfile` or `requirements.txt
 ```bash
 docker compose run spark-app python src/scripts/verify_data.py
 ```
+
+### 4. Run the Preprocessing Pipelines
+```bash
+docker compose run spark-app
+```
+This runs `main.py`, which saves cleaned parquet outputs to:
+```text
+data/processed/articles
+data/processed/customers
+data/processed/transactions
+```
+
+### 5. Run a Team-Member Transformation Pipeline
+Example:
+Roman's standalone financial performance pipeline is available at:
+```text
+src/transformations/roman_pipeline.py
+```
+
+Run it with:
+```bash
+docker compose run --rm spark-app python src/transformations/roman_pipeline.py
+```
+
+It reads the processed parquet data and writes outputs to:
+```text
+output/roman/csv/
+output/roman/plots/
+output/roman/logs/
+```
+
+The `output/` directory is mounted into the container, so generated CSV files, plots, and explain logs are persisted on your local machine.
 ---
 
 ## Two Modes of Work
@@ -51,6 +83,9 @@ docker compose run spark-app
 
 # Run a specific script
 docker compose run spark-app python src/scripts/verify_data.py
+
+# Run Roman's transformation pipeline
+docker compose run --rm spark-app python src/transformations/roman_pipeline.py
 ```
 
 Data is mounted at `/app/data` inside the container, so in your scripts use:
@@ -72,6 +107,11 @@ In notebooks, use absolute container paths for data:
 df = spark.read.csv("/app/data/raw/articles.csv", header=True, inferSchema=True)
 ```
 
+Generated transformation outputs are also available inside the container at:
+```text
+/app/output
+```
+
 To stop the notebook server, press `Ctrl+C` in the terminal or run:
 ```bash
 docker compose down
@@ -86,6 +126,7 @@ docker compose down
 | `docker compose build` | Build (or rebuild) the image |
 | `docker compose run spark-app` | Run `main.py` |
 | `docker compose run spark-app python <script>` | Run a specific script |
+| `docker compose run --rm spark-app python src/transformations/roman_pipeline.py` | Run Roman's finance transformation pipeline |
 | `docker compose up notebook` | Start Jupyter Lab on port 8888 |
 | `docker compose down` | Stop all services and remove containers |
 | `docker compose down --remove-orphans` | Stop all and clean up orphan containers |

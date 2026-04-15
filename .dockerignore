@@ -1,7 +1,11 @@
 data/
+output/
 .git/
 .idea/
+.venv/
+.pytest_cache/
 .ipynb_checkpoints/
 __pycache__/
 *.pyc
 notebooks/
+.DS_Store
