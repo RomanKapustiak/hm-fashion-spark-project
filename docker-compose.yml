@@ -11,6 +11,7 @@ services:
       - ./src:/app/src
       - ./tests:/app/tests
       - ./main.py:/app/main.py
+      - ./output:/output
     environment:
       - SPARK_LOCAL_DIRS=/tmp/spark
 
