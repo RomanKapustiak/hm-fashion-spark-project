@@ -78,7 +78,7 @@ The `output/` directory is mounted into the container, so generated CSV files, p
 Use `spark-app` service to execute any Python script inside the container.
 
 ```bash
-# Run the default entry point (main.py)
+# Run the default entry point (main.py) - preprocessing pipeline
 docker compose run spark-app
 
 # Run a specific script
