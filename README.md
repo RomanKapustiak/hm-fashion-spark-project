@@ -69,6 +69,23 @@ output/roman/plots/
 output/roman/logs/
 ```
 
+Yura's standalone visual trends pipeline is available at:
+```text
+src/transformations/yura_pipeline.py
+```
+
+Run it with:
+```bash
+docker compose run --rm spark-app python src/transformations/yura_pipeline.py
+```
+
+It reads the processed parquet data and writes outputs to:
+```text
+output/yura/csv/
+output/yura/plots/
+output/yura/logs/
+```
+
 The `output/` directory is mounted into the container, so generated CSV files, plots, and explain logs are persisted on your local machine.
 ---
 
@@ -89,6 +106,9 @@ docker compose run --rm spark-app python src/transformations/roman_pipeline.py
 
 # Run Artem's transformation pipeline
 docker compose run --rm spark-app python src/transformations/artem_pipeline.py
+
+# Run Yura's transformation pipeline
+docker compose run --rm spark-app python src/transformations/yura_pipeline.py
 
 # Run Taras's transformation pipeline
 docker compose run --rm spark-app python src/transformations/taras_pipeline.py
@@ -137,6 +157,7 @@ docker compose down
 | `docker compose run spark-app python <script>` | Run a specific script |
 | `docker compose run --rm spark-app python src/transformations/roman_pipeline.py` | Run Roman's finance transformation pipeline |
 | `docker compose run --rm spark-app python src/transformations/artem_pipeline.py` | Run Artem's customer transformation pipeline |
+| `docker compose run --rm spark-app python src/transformations/yura_pipeline.py` | Run Yura's visual trends transformation pipeline |
 | `docker compose run --rm spark-app python src/transformations/taras_pipeline.py` | Run Taras's product transformation pipeline |
 | `docker compose run --rm spark-app python src/transformations/dmytro_pipeline.py` | Run Dmytro's transformation pipeline |
 | `docker compose up notebook` | Start Jupyter Lab on port 8888 |
