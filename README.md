@@ -109,6 +109,12 @@ docker compose run --rm spark-app python src/transformations/artem_pipeline.py
 
 # Run Yura's transformation pipeline
 docker compose run --rm spark-app python src/transformations/yura_pipeline.py
+
+# Run Taras's transformation pipeline
+docker compose run --rm spark-app python src/transformations/taras_pipeline.py
+
+# Run Dmytro's transformation pipeline
+docker compose run --rm spark-app python src/transformations/dmytro_pipeline.py
 ```
 
 Data is mounted at `/app/data` inside the container, so in your scripts use:
@@ -152,6 +158,8 @@ docker compose down
 | `docker compose run --rm spark-app python src/transformations/roman_pipeline.py` | Run Roman's finance transformation pipeline |
 | `docker compose run --rm spark-app python src/transformations/artem_pipeline.py` | Run Artem's customer transformation pipeline |
 | `docker compose run --rm spark-app python src/transformations/yura_pipeline.py` | Run Yura's visual trends transformation pipeline |
+| `docker compose run --rm spark-app python src/transformations/taras_pipeline.py` | Run Taras's product transformation pipeline |
+| `docker compose run --rm spark-app python src/transformations/dmytro_pipeline.py` | Run Dmytro's transformation pipeline |
 | `docker compose up notebook` | Start Jupyter Lab on port 8888 |
 | `docker compose down` | Stop all services and remove containers |
 | `docker compose down --remove-orphans` | Stop all and clean up orphan containers |
