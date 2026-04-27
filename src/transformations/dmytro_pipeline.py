@@ -1,502 +1,467 @@
-"""Dmytro transformation pipeline (time-series dynamics and retention)."""
+"""Dmytro transformation pipeline (time-series dynamics and retention reports)."""
 
 from __future__ import annotations
 
-import io
 import os
 import sys
-from typing import Callable
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import pandas as pd
-import seaborn as sns
-from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
-from pyspark.sql.types import BooleanType
-from pyspark.sql.window import Window
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from src.spark_utils import create_spark_session
+from src.transformations.report_utils import (
+    build_age_group_expression,
+    build_channel_label_expression,
+    build_weekday_label_expression,
+    ensure_output_dirs,
+    initialize_explain_log,
+    load_parquet_dataset,
+    round_existing,
+    save_report,
+)
 
 
-SECONDS_IN_DAY = 86400
-
-
-def _prepare_query_3_plot_data(df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate retention gaps into readable buckets and compute share."""
-    if df.empty:
-        return pd.DataFrame(
-            columns=["bucket_label", "customers_count", "customers_share_pct"]
-        )
-
-    bucket_order = [
-        "0 days (same day)",
-        "1-7 days",
-        "8-30 days",
-        "31-90 days",
-        "91-180 days",
-        "181-365 days",
-        "366+ days",
-    ]
-    prepared = df.copy()
-    prepared["bucket_label"] = "366+ days"
-    prepared.loc[prepared["days_between"] == 0, "bucket_label"] = "0 days (same day)"
-    prepared.loc[
-        prepared["days_between"].between(1, 7, inclusive="both"), "bucket_label"
-    ] = "1-7 days"
-    prepared.loc[
-        prepared["days_between"].between(8, 30, inclusive="both"), "bucket_label"
-    ] = "8-30 days"
-    prepared.loc[
-        prepared["days_between"].between(31, 90, inclusive="both"), "bucket_label"
-    ] = "31-90 days"
-    prepared.loc[
-        prepared["days_between"].between(91, 180, inclusive="both"), "bucket_label"
-    ] = "91-180 days"
-    prepared.loc[
-        prepared["days_between"].between(181, 365, inclusive="both"), "bucket_label"
-    ] = "181-365 days"
-
-    grouped = (
-        prepared.groupby("bucket_label", as_index=False)["customers_count"]
-        .sum()
-        .set_index("bucket_label")
-        .reindex(bucket_order, fill_value=0)
-        .reset_index()
-    )
-    total_customers = grouped["customers_count"].sum()
-    grouped["customers_share_pct"] = (
-        grouped["customers_count"] / total_customers * 100 if total_customers else 0.0
-    )
-    return grouped
-
-
+# Питання: Якими є показники динаміки транзакцій і виручки у вибірці з 8 квартально-канальних сегментів 2019 року?
+# Опис колонок:
+# - Квартал_2019_року: Квартал 2019 року.
+# - Канал_продажу: Назва каналу продажу.
+# - Кількість_транзакцій: Загальна кількість транзакцій у кварталі.
+# - Загальна_виручка: Загальна виручка у кварталі.
+# - Середня_ціна_товару: Середня ціна покупки у кварталі.
+# - Кількість_транзакцій_попереднього_кварталу: Кількість транзакцій цього каналу у попередньому кварталі.
+# - Виручка_попереднього_кварталу: Виручка цього каналу у попередньому кварталі.
+# - Зміна_кількості_транзакцій_до_попереднього_кварталу_(відсоток): Темп зміни кількості транзакцій відносно попереднього кварталу.
+# - Зміна_виручки_до_попереднього_кварталу_(відсоток): Темп зміни виручки відносно попереднього кварталу.
 def query_1_weekly_transaction_dynamics(transactions_df: DataFrame) -> DataFrame:
-    """Weekly total transaction count across the full dataset period."""
-    weekly = (
-        transactions_df.withColumn("year", F.year("t_dat"))
-        .withColumn("week", F.weekofyear("t_dat"))
-        .groupBy("year", "week")
-        .agg(F.count("*").alias("transactions_count"))
-    )
-    wow_window = Window.orderBy("year", "week")
-    yoy_window = Window.partitionBy("week").orderBy("year")
-    return (
-        weekly.withColumn("prev_week_transactions", F.lag("transactions_count").over(wow_window))
-        .withColumn("prev_year_transactions", F.lag("transactions_count").over(yoy_window))
+    """Quarterly transaction and revenue report by channel for 2019."""
+    quarter_window = Window.partitionBy("Channel_Name").orderBy("Quarter_Label")
+
+    result_df = (
+        transactions_df
+        .filter(F.col("t_dat").isNotNull())
+        .filter(F.col("price") > 0)
+        .filter(F.year("t_dat") == 2019)
+        .withColumn("Quarter_Label", F.concat(F.lit("2019-Q"), F.quarter("t_dat")))
+        .withColumn("Channel_Name", build_channel_label_expression())
+        .groupBy("Quarter_Label", "Channel_Name")
+        .agg(
+            F.count("*").alias("Transaction_Count"),
+            F.sum("price").alias("Total_Revenue"),
+            F.avg("price").alias("Avg_Price"),
+        )
+        .withColumn("Prev_Quarter_Transactions", F.lag("Transaction_Count").over(quarter_window))
+        .withColumn("Prev_Quarter_Revenue", F.lag("Total_Revenue").over(quarter_window))
         .withColumn(
-            "wow_change_pct",
+            "QoQ_Transaction_Change_Pct",
             F.when(
-                F.col("prev_week_transactions") > 0,
-                (F.col("transactions_count") - F.col("prev_week_transactions"))
-                / F.col("prev_week_transactions")
-                * 100.0,
+                F.col("Prev_Quarter_Transactions") > 0,
+                (F.col("Transaction_Count") - F.col("Prev_Quarter_Transactions")) / F.col("Prev_Quarter_Transactions") * 100.0,
             ),
         )
         .withColumn(
-            "yoy_change_pct",
+            "QoQ_Revenue_Change_Pct",
             F.when(
-                F.col("prev_year_transactions") > 0,
-                (F.col("transactions_count") - F.col("prev_year_transactions"))
-                / F.col("prev_year_transactions")
-                * 100.0,
+                F.col("Prev_Quarter_Revenue") > 0,
+                (F.col("Total_Revenue") - F.col("Prev_Quarter_Revenue")) / F.col("Prev_Quarter_Revenue") * 100.0,
             ),
         )
-        .orderBy("year", "week")
+        .orderBy("Quarter_Label", "Channel_Name")
+        .limit(8)
+    )
+    return round_existing(
+        result_df,
+        {
+            "Total_Revenue": 2,
+            "Avg_Price": 4,
+            "Prev_Quarter_Revenue": 2,
+            "QoQ_Transaction_Change_Pct": 2,
+            "QoQ_Revenue_Change_Pct": 2,
+        },
+    ).select(
+        F.col("Quarter_Label").alias("Квартал_2019_року"),
+        F.col("Channel_Name").alias("Канал_продажу"),
+        F.col("Transaction_Count").alias("Кількість_транзакцій"),
+        F.col("Total_Revenue").alias("Загальна_виручка"),
+        F.col("Avg_Price").alias("Середня_ціна_товару"),
+        F.col("Prev_Quarter_Transactions").alias("Кількість_транзакцій_попереднього_кварталу"),
+        F.col("Prev_Quarter_Revenue").alias("Виручка_попереднього_кварталу"),
+        F.col("QoQ_Transaction_Change_Pct").alias("Зміна_кількості_транзакцій_до_попереднього_кварталу_(відсоток)"),
+        F.col("QoQ_Revenue_Change_Pct").alias("Зміна_виручки_до_попереднього_кварталу_(відсоток)"),
     )
 
 
+# Питання: Які 15 комбінацій товарних і глобальних товарних груп характеризуються найбільшою різницею між зимовою та літньою виручкою?
+# Опис колонок:
+# - Товарна_група: Назва товарної групи.
+# - Глобальна_товарна_група: Назва глобальної товарної групи.
+# - Кількість_транзакцій_взимку: Кількість транзакцій узимку.
+# - Кількість_транзакцій_влітку: Кількість транзакцій улітку.
+# - Виручка_взимку: Загальна виручка узимку.
+# - Виручка_влітку: Загальна виручка влітку.
+# - Різниця_між_виручкою_взимку_та_влітку: Абсолютна різниця між зимовою та літньою виручкою.
+# - Частка_зимової_виручки_від_сумарної_сезонної_виручки_(відсоток): Частка зимової виручки від суми зимової та літньої виручки.
 def query_2_winter_vs_summer_spike(
     transactions_df: DataFrame,
     articles_df: DataFrame,
 ) -> DataFrame:
-    """Sales spike by product group in winter (Dec-Feb) versus summer (Jun-Aug)."""
-    seasonal_sales = (
-        transactions_df.withColumn("month", F.month("t_dat"))
-        .filter(F.col("month").isin([12, 1, 2, 6, 7, 8]))
-        .withColumn(
-            "season",
-            F.when(F.col("month").isin([12, 1, 2]), F.lit("Winter")).otherwise(
-                F.lit("Summer")
-            ),
-        )
-        .join(articles_df.select("article_id", "product_group_name"), on="article_id")
-        .groupBy("product_group_name", "season")
-        .agg(F.count("*").alias("sales_count"))
-    )
-
-    return (
-        seasonal_sales.groupBy("product_group_name")
-        .pivot("season", ["Winter", "Summer"])
-        .sum("sales_count")
-        .na.fill(0)
-        .withColumnRenamed("Winter", "winter_sales")
-        .withColumnRenamed("Summer", "summer_sales")
-        .withColumn("sales_spike", F.col("winter_sales") - F.col("summer_sales"))
-        .withColumn(
-            "seasonal_delta_pct",
-            F.when(
-                F.greatest(F.col("winter_sales"), F.col("summer_sales")) > 0,
-                F.col("sales_spike")
-                / F.greatest(F.col("winter_sales"), F.col("summer_sales"))
-                * 100.0,
-            ).otherwise(F.lit(0.0)),
+    """Seasonal report by product group and index group for winter versus summer."""
+    seasonal_df = (
+        transactions_df
+        .filter(F.col("t_dat").isNotNull())
+        .withColumn("Month_Num", F.month("t_dat"))
+        .filter(F.col("Month_Num").isin([12, 1, 2, 6, 7, 8]))
+        .join(
+            articles_df.select("article_id", "product_group_name", "index_group_name"),
+            on="article_id",
+            how="inner",
         )
         .withColumn(
-            "seasonality_index",
-            F.when(
-                (F.col("winter_sales") + F.col("summer_sales")) > 0,
-                F.col("winter_sales")
-                / (F.col("winter_sales") + F.col("summer_sales"))
-                * 100.0,
-            ).otherwise(F.lit(0.0)),
+            "Season_Name",
+            F.when(F.col("Month_Num").isin([12, 1, 2]), F.lit("Winter")).otherwise(F.lit("Summer")),
         )
-        .orderBy(F.desc("sales_spike"), "product_group_name")
-    )
-
-
-def query_3_retention_gap_distribution(transactions_df: DataFrame) -> DataFrame:
-    """Distribution of days between first and second purchase per customer."""
-    purchase_order = Window.partitionBy("customer_id").orderBy("t_dat")
-    first_two = (
-        transactions_df.select("customer_id", "t_dat")
-        .withColumn("purchase_rank", F.row_number().over(purchase_order))
-        .filter(F.col("purchase_rank") <= 2)
-    )
-
-    first_second = (
-        first_two.groupBy("customer_id")
+        .withColumn("Product_Group_Name", F.initcap(F.coalesce(F.trim(F.col("product_group_name")), F.lit("Unknown"))))
+        .withColumn("Index_Group_Name", F.initcap(F.coalesce(F.trim(F.col("index_group_name")), F.lit("Unknown"))))
+        .groupBy("Product_Group_Name", "Index_Group_Name", "Season_Name")
         .agg(
-            F.min("t_dat").alias("first_purchase_date"),
-            F.max("t_dat").alias("second_purchase_date"),
-            F.count("*").alias("purchase_rows"),
+            F.count("*").alias("Transaction_Count"),
+            F.sum("price").alias("Total_Revenue"),
         )
-        .filter(F.col("purchase_rows") == 2)
+    )
+
+    winter_df = seasonal_df.filter(F.col("Season_Name") == "Winter").select(
+        "Product_Group_Name",
+        "Index_Group_Name",
+        F.col("Transaction_Count").alias("Winter_Transaction_Count"),
+        F.col("Total_Revenue").alias("Winter_Revenue"),
+    )
+    summer_df = seasonal_df.filter(F.col("Season_Name") == "Summer").select(
+        "Product_Group_Name",
+        "Index_Group_Name",
+        F.col("Transaction_Count").alias("Summer_Transaction_Count"),
+        F.col("Total_Revenue").alias("Summer_Revenue"),
+    )
+
+    result_df = (
+        winter_df
+        .join(summer_df, on=["Product_Group_Name", "Index_Group_Name"], how="full")
+        .na.fill(0, subset=["Winter_Transaction_Count", "Winter_Revenue", "Summer_Transaction_Count", "Summer_Revenue"])
+        .withColumn("Revenue_Delta", F.col("Winter_Revenue") - F.col("Summer_Revenue"))
         .withColumn(
-            "days_between",
-            F.datediff("second_purchase_date", "first_purchase_date"),
+            "Seasonality_Index_Pct",
+            F.when(
+                (F.col("Winter_Revenue") + F.col("Summer_Revenue")) > 0,
+                F.col("Winter_Revenue") / (F.col("Winter_Revenue") + F.col("Summer_Revenue")) * 100.0,
+            ).otherwise(F.lit(0.0)),
+        )
+        .orderBy(F.desc(F.abs("Revenue_Delta")), "Product_Group_Name")
+        .limit(15)
+    )
+    return round_existing(
+        result_df,
+        {
+            "Winter_Revenue": 2,
+            "Summer_Revenue": 2,
+            "Revenue_Delta": 2,
+            "Seasonality_Index_Pct": 2,
+        },
+    ).select(
+        F.col("Product_Group_Name").alias("Товарна_група"),
+        F.col("Index_Group_Name").alias("Глобальна_товарна_група"),
+        F.col("Winter_Transaction_Count").alias("Кількість_транзакцій_взимку"),
+        F.col("Summer_Transaction_Count").alias("Кількість_транзакцій_влітку"),
+        F.col("Winter_Revenue").alias("Виручка_взимку"),
+        F.col("Summer_Revenue").alias("Виручка_влітку"),
+        F.col("Revenue_Delta").alias("Різниця_між_виручкою_взимку_та_влітку"),
+        F.col("Seasonality_Index_Pct").alias("Частка_зимової_виручки_від_сумарної_сезонної_виручки_(відсоток)"),
+    )
+
+
+# Питання: Якими є показники утримання клієнтів у 12 найчисленніших сегментах, сформованих за віковими групами та інтервалами між першою і другою покупкою?
+# Опис колонок:
+# - Вікова_група: Віковий діапазон клієнтів.
+# - Інтервал_між_першою_та_другою_покупкою: Категорія тривалості між першою та другою покупкою.
+# - Кількість_клієнтів: Кількість клієнтів у сегменті.
+# - Середня_вартість_першої_покупки: Середня вартість першої покупки клієнтів сегмента.
+# - Середня_кількість_днів_між_покупками: Середня кількість днів між першою та другою покупкою.
+# - Частка_від_клієнтів_цієї_вікової_групи_(відсоток): Частка клієнтів сегмента серед усіх клієнтів відповідної вікової групи.
+def query_3_retention_gap_distribution(
+    transactions_df: DataFrame,
+    customers_df: DataFrame,
+) -> DataFrame:
+    """Retention-stage report by age group with customer share and first-order value."""
+    purchase_order = Window.partitionBy("customer_id").orderBy("t_dat")
+    share_window = Window.partitionBy("Age_Group")
+
+    ordered_df = (
+        transactions_df
+        .filter(F.col("t_dat").isNotNull())
+        .withColumn("Purchase_Rank", F.row_number().over(purchase_order))
+        .filter(F.col("Purchase_Rank") <= 2)
+    )
+
+    first_second_df = (
+        ordered_df
+        .groupBy("customer_id")
+        .agg(
+            F.min("t_dat").alias("First_Purchase_Date"),
+            F.max("t_dat").alias("Second_Purchase_Date"),
+            F.max(F.when(F.col("Purchase_Rank") == 1, F.col("price"))).alias("First_Order_Value"),
+            F.count("*").alias("Purchase_Row_Count"),
+        )
+        .filter(F.col("Purchase_Row_Count") == 2)
+        .withColumn("Days_Between", F.datediff("Second_Purchase_Date", "First_Purchase_Date"))
+        .join(customers_df.select("customer_id", "age"), on="customer_id", how="left")
+        .withColumn("Age_Group", build_age_group_expression("age"))
+        .withColumn(
+            "Retention_Bucket",
+            F.when(F.col("Days_Between") == 0, F.lit("Same Day"))
+            .when(F.col("Days_Between").between(1, 7), F.lit("1-7 Days"))
+            .when(F.col("Days_Between").between(8, 30), F.lit("8-30 Days"))
+            .when(F.col("Days_Between").between(31, 90), F.lit("31-90 Days"))
+            .when(F.col("Days_Between").between(91, 180), F.lit("91-180 Days"))
+            .otherwise(F.lit("181+ Days")),
         )
     )
 
-    return (
-        first_second.groupBy("days_between")
-        .agg(F.count("*").alias("customers_count"))
-        .orderBy("days_between")
+    result_df = (
+        first_second_df
+        .groupBy("Age_Group", "Retention_Bucket")
+        .agg(
+            F.countDistinct("customer_id").alias("Customer_Count"),
+            F.avg("First_Order_Value").alias("Avg_First_Order_Value"),
+            F.avg("Days_Between").alias("Avg_Days_Between"),
+        )
+        .withColumn("Age_Group_Total", F.sum("Customer_Count").over(share_window))
+        .withColumn(
+            "Customer_Share_Pct",
+            F.when(F.col("Age_Group_Total") > 0, F.col("Customer_Count") / F.col("Age_Group_Total") * 100.0).otherwise(F.lit(0.0)),
+        )
+        .drop("Age_Group_Total")
+        .orderBy(F.desc("Customer_Count"), "Age_Group", "Retention_Bucket")
+        .limit(12)
+    )
+    return round_existing(
+        result_df,
+        {
+            "Avg_First_Order_Value": 4,
+            "Avg_Days_Between": 2,
+            "Customer_Share_Pct": 2,
+        },
+    ).select(
+        F.col("Age_Group").alias("Вікова_група"),
+        F.col("Retention_Bucket").alias("Інтервал_між_першою_та_другою_покупкою"),
+        F.col("Customer_Count").alias("Кількість_клієнтів"),
+        F.col("Avg_First_Order_Value").alias("Середня_вартість_першої_покупки"),
+        F.col("Avg_Days_Between").alias("Середня_кількість_днів_між_покупками"),
+        F.col("Customer_Share_Pct").alias("Частка_від_клієнтів_цієї_вікової_групи_(відсоток)"),
     )
 
 
+# Питання: Якими є характеристики пікових днів продажів у вибірці з 8 квартально-канальних сегментів 2019 року?
+# Опис колонок:
+# - Квартал_2019_року: Квартал 2019 року.
+# - Канал_продажу: Назва каналу продажу.
+# - Піковий_день: Дата з найбільшою кількістю транзакцій у кварталі.
+# - Кількість_транзакцій_у_піковий_день: Кількість транзакцій у піковий день.
+# - Кількість_транзакцій_у_кварталі: Загальна кількість транзакцій у кварталі.
+# - Виручка_у_піковий_день: Загальна виручка пікового дня.
+# - Частка_пікового_дня_від_транзакцій_кварталу_(відсоток): Частка транзакцій пікового дня від усіх транзакцій кварталу.
+# - Співвідношення_пікового_дня_до_середнього_денного_рівня: Відношення транзакцій пікового дня до середньоденного рівня кварталу.
 def query_4_top_peak_days_month_share(transactions_df: DataFrame) -> DataFrame:
-    """Top 10 highest daily sales peaks and their share of monthly transaction volume."""
-    daily_counts = (
-        transactions_df.filter(F.col("t_dat").isNotNull())
-        .withColumn("month_start", F.date_trunc("month", F.col("t_dat")))
-        .groupBy("t_dat", "month_start")
-        .agg(F.count("*").alias("daily_transactions"))
-    )
-    month_stats = daily_counts.groupBy("month_start").agg(
-        F.sum("daily_transactions").alias("monthly_revenue"),
-        F.expr("percentile_approx(daily_transactions, 0.5)").alias("monthly_median_daily"),
-        F.avg("daily_transactions").alias("monthly_mean_daily"),
-        F.stddev_pop("daily_transactions").alias("monthly_std_daily"),
-    )
-    ranked = (
-        daily_counts.join(month_stats, on="month_start", how="left")
-        .withColumn(
-            "monthly_share",
-            F.col("daily_transactions") / F.col("monthly_revenue"),
+    """Quarterly peak-day report by channel including quarter share and intensity."""
+    peak_window = Window.partitionBy("Quarter_Label", "Channel_Name").orderBy(F.desc("Daily_Transaction_Count"), F.asc("t_dat"))
+
+    daily_df = (
+        transactions_df
+        .filter(F.col("t_dat").isNotNull())
+        .filter(F.year("t_dat") == 2019)
+        .withColumn("Quarter_Label", F.concat(F.lit("2019-Q"), F.quarter("t_dat")))
+        .withColumn("Channel_Name", build_channel_label_expression())
+        .groupBy("Quarter_Label", "Channel_Name", "t_dat")
+        .agg(
+            F.count("*").alias("Daily_Transaction_Count"),
+            F.sum("price").alias("Daily_Revenue"),
         )
-        .withColumn(
-            "peak_intensity_ratio",
-            F.when(
-                F.col("monthly_median_daily") > 0,
-                F.col("daily_transactions") / F.col("monthly_median_daily"),
-            ),
+    )
+
+    quarterly_df = (
+        daily_df
+        .groupBy("Quarter_Label", "Channel_Name")
+        .agg(
+            F.sum("Daily_Transaction_Count").alias("Quarter_Transaction_Count"),
+            F.avg("Daily_Transaction_Count").alias("Avg_Daily_Transaction_Count"),
         )
+    )
+
+    result_df = (
+        daily_df
+        .join(quarterly_df, on=["Quarter_Label", "Channel_Name"], how="inner")
+        .withColumn("Peak_Rank", F.row_number().over(peak_window))
+        .filter(F.col("Peak_Rank") == 1)
+        .withColumnRenamed("t_dat", "Peak_Day")
         .withColumn(
-            "z_score",
+            "Peak_Day_Share_Pct",
             F.when(
-                F.col("monthly_std_daily") > 0,
-                (F.col("daily_transactions") - F.col("monthly_mean_daily"))
-                / F.col("monthly_std_daily"),
+                F.col("Quarter_Transaction_Count") > 0,
+                F.col("Daily_Transaction_Count") / F.col("Quarter_Transaction_Count") * 100.0,
             ).otherwise(F.lit(0.0)),
         )
         .withColumn(
-            "peak_rank", F.row_number().over(Window.orderBy(F.desc("daily_transactions")))
+            "Peak_vs_Avg_Daily_Ratio",
+            F.when(F.col("Avg_Daily_Transaction_Count") > 0, F.col("Daily_Transaction_Count") / F.col("Avg_Daily_Transaction_Count")),
         )
+        .orderBy("Quarter_Label", "Channel_Name")
+        .limit(8)
     )
-    return (
-        ranked.filter(F.col("peak_rank") <= 10)
-        .withColumnRenamed("daily_transactions", "daily_revenue")
-        .drop("monthly_mean_daily", "monthly_std_daily")
-        .orderBy(F.desc("daily_revenue"), "t_dat")
+    return round_existing(
+        result_df,
+        {
+            "Daily_Revenue": 2,
+            "Peak_Day_Share_Pct": 2,
+            "Peak_vs_Avg_Daily_Ratio": 2,
+        },
+    ).select(
+        F.col("Quarter_Label").alias("Квартал_2019_року"),
+        F.col("Channel_Name").alias("Канал_продажу"),
+        F.col("Peak_Day").alias("Піковий_день"),
+        F.col("Daily_Transaction_Count").alias("Кількість_транзакцій_у_піковий_день"),
+        F.col("Quarter_Transaction_Count").alias("Кількість_транзакцій_у_кварталі"),
+        F.col("Daily_Revenue").alias("Виручка_у_піковий_день"),
+        F.col("Peak_Day_Share_Pct").alias("Частка_пікового_дня_від_транзакцій_кварталу_(відсоток)"),
+        F.col("Peak_vs_Avg_Daily_Ratio").alias("Співвідношення_пікового_дня_до_середнього_денного_рівня"),
     )
 
 
+# Питання: Які 7 днів тижня демонструють найвищі показники аномальної активності серед клієнтів віком 30-40 років?
+# Опис колонок:
+# - День_тижня: Назва дня тижня.
+# - Кількість_активних_днів: Кількість днів з продажами у вибраному дні тижня.
+# - Середня_кількість_транзакцій_за_день: Середня денна кількість транзакцій.
+# - Середня_7_денна_ковзна_кількість_транзакцій: Середнє значення 7-денної ковзної кількості транзакцій.
+# - Кількість_аномальних_днів: Кількість днів, що перевищили верхню межу аномальності.
+# - Частка_аномальних_днів_від_усіх_активних_днів_(відсоток): Частка аномальних днів серед усіх активних днів цього дня тижня.
 def query_5_rolling_activity_30_40(
     transactions_df: DataFrame,
     customers_df: DataFrame,
 ) -> DataFrame:
-    """7-day rolling average of purchase activity for customers aged 30-40."""
-    daily_counts = (
-        transactions_df.join(
-            customers_df.filter((F.col("age") >= 30) & (F.col("age") <= 40)).select(
-                "customer_id"
-            ),
+    """Weekday outlier-activity summary for customers aged 30-40."""
+    rolling_window = Window.orderBy("Sale_Timestamp").rangeBetween(-6 * 86400, 0)
+
+    daily_df = (
+        transactions_df
+        .join(
+            customers_df.filter((F.col("age") >= 30) & (F.col("age") <= 40)).select("customer_id"),
             on="customer_id",
+            how="inner",
         )
+        .filter(F.col("t_dat").isNotNull())
         .groupBy("t_dat")
-        .agg(F.count("*").alias("purchases_count"))
-        .orderBy("t_dat")
-        .withColumn("event_ts", F.to_timestamp("t_dat"))
-        .withColumn("event_seconds", F.col("event_ts").cast("long"))
+        .agg(F.count("*").alias("Daily_Transaction_Count"))
+        .withColumn("Weekday_Num", F.dayofweek("t_dat"))
+        .withColumn("Weekday_Name", build_weekday_label_expression("Weekday_Num"))
+        .withColumn("Sale_Timestamp", F.col("t_dat").cast("timestamp").cast("long"))
     )
-    rolling_window = Window.orderBy("event_seconds").rangeBetween(-6 * SECONDS_IN_DAY, 0)
-    return (
-        daily_counts.withColumn(
-            "rolling_avg_7d", F.avg("purchases_count").over(rolling_window)
+
+    activity_df = (
+        daily_df
+        .withColumn("Rolling_7d_Avg", F.avg("Daily_Transaction_Count").over(rolling_window))
+        .withColumn("Rolling_7d_Std", F.stddev_pop("Daily_Transaction_Count").over(rolling_window))
+        .withColumn("Upper_Band", F.col("Rolling_7d_Avg") + 2 * F.col("Rolling_7d_Std"))
+        .withColumn("Is_Outlier", F.col("Daily_Transaction_Count") > F.col("Upper_Band"))
+    )
+
+    result_df = (
+        activity_df
+        .groupBy("Weekday_Name")
+        .agg(
+            F.count("*").alias("Active_Day_Count"),
+            F.avg("Daily_Transaction_Count").alias("Avg_Daily_Transaction_Count"),
+            F.avg("Rolling_7d_Avg").alias("Avg_Rolling_7d_Transactions"),
+            F.sum(F.when(F.col("Is_Outlier"), F.lit(1)).otherwise(F.lit(0))).alias("Outlier_Day_Count"),
         )
-        .withColumn("rolling_std_7d", F.stddev_pop("purchases_count").over(rolling_window))
-        .withColumn("upper_band_2sigma", F.col("rolling_avg_7d") + 2 * F.col("rolling_std_7d"))
         .withColumn(
-            "lower_band_2sigma",
-            F.greatest(F.lit(0.0), F.col("rolling_avg_7d") - 2 * F.col("rolling_std_7d")),
+            "Outlier_Share_Pct",
+            F.when(F.col("Active_Day_Count") > 0, F.col("Outlier_Day_Count") / F.col("Active_Day_Count") * 100.0).otherwise(F.lit(0.0)),
         )
-        .withColumn("is_outlier", F.col("purchases_count") > F.col("upper_band_2sigma"))
-        .select(
-            "t_dat",
-            "purchases_count",
-            "rolling_avg_7d",
-            "rolling_std_7d",
-            "upper_band_2sigma",
-            "lower_band_2sigma",
-            "is_outlier",
-        )
-        .orderBy("t_dat")
+        .orderBy("Weekday_Name")
+        .limit(7)
+    )
+    return round_existing(
+        result_df,
+        {
+            "Avg_Daily_Transaction_Count": 2,
+            "Avg_Rolling_7d_Transactions": 2,
+            "Outlier_Share_Pct": 2,
+        },
+    ).select(
+        F.col("Weekday_Name").alias("День_тижня"),
+        F.col("Active_Day_Count").alias("Кількість_активних_днів"),
+        F.col("Avg_Daily_Transaction_Count").alias("Середня_кількість_транзакцій_за_день"),
+        F.col("Avg_Rolling_7d_Transactions").alias("Середня_7_денна_ковзна_кількість_транзакцій"),
+        F.col("Outlier_Day_Count").alias("Кількість_аномальних_днів"),
+        F.col("Outlier_Share_Pct").alias("Частка_аномальних_днів_від_усіх_активних_днів_(відсоток)"),
     )
 
 
+# Питання: Яким є розподіл покупок у вибірці з 14 сегментів, сформованих за статусом ACTIVE або PRE-CREATE та днем тижня?
+# Опис колонок:
+# - Статус_клубного_членства: Статус клубного членства клієнта.
+# - День_тижня: Назва дня тижня.
+# - Кількість_транзакцій: Кількість транзакцій у цей день тижня.
+# - Загальна_кількість_транзакцій_за_статусом: Загальна кількість транзакцій для цього статусу.
+# - Частка_від_транзакцій_даного_статусу_(відсоток): Частка транзакцій дня тижня серед усіх транзакцій цього статусу.
+# - Індекс_відносно_середнього_рівня_дня_тижня_(відсоток): Індекс відносно середнього рівня транзакцій цього дня тижня між статусами.
 def query_6_frequency_loyal_vs_guest(
     transactions_df: DataFrame,
     customers_df: DataFrame,
 ) -> DataFrame:
-    """Purchase frequency by day-of-week for ACTIVE vs PRE-CREATE customers."""
-    base = (
-        transactions_df.join(
-            customers_df.filter(
-                F.col("club_member_status").isin(["ACTIVE", "PRE-CREATE"])
-            ).select("customer_id", "club_member_status"),
+    """Weekday purchase-share report for ACTIVE versus PRE-CREATE customers."""
+    segment_window = Window.partitionBy("Club_Member_Status")
+    day_window = Window.partitionBy("Weekday_Name")
+
+    base_df = (
+        transactions_df
+        .join(
+            customers_df.filter(F.col("club_member_status").isin(["ACTIVE", "PRE-CREATE"])).select("customer_id", "club_member_status"),
             on="customer_id",
+            how="inner",
         )
-        .withColumn("day_of_week", F.dayofweek("t_dat"))
-        .groupBy("club_member_status", "day_of_week")
-        .agg(F.count("*").alias("purchases_count"))
+        .filter(F.col("t_dat").isNotNull())
+        .withColumn("Weekday_Num", F.dayofweek("t_dat"))
+        .withColumn("Weekday_Name", build_weekday_label_expression("Weekday_Num"))
+        .withColumn("Club_Member_Status", F.col("club_member_status"))
+        .groupBy("Club_Member_Status", "Weekday_Name")
+        .agg(F.count("*").alias("Transaction_Count"))
     )
-    segment_window = Window.partitionBy("club_member_status")
-    day_window = Window.partitionBy("day_of_week")
-    return (
-        base.withColumn("segment_total_purchases", F.sum("purchases_count").over(segment_window))
+
+    result_df = (
+        base_df
+        .withColumn("Segment_Total_Transactions", F.sum("Transaction_Count").over(segment_window))
         .withColumn(
-            "segment_day_share_pct",
-            F.when(
-                F.col("segment_total_purchases") > 0,
-                F.col("purchases_count") / F.col("segment_total_purchases") * 100.0,
-            ).otherwise(F.lit(0.0)),
+            "Segment_Day_Share_Pct",
+            F.when(F.col("Segment_Total_Transactions") > 0, F.col("Transaction_Count") / F.col("Segment_Total_Transactions") * 100.0).otherwise(F.lit(0.0)),
         )
-        .withColumn("day_avg_across_segments", F.avg("purchases_count").over(day_window))
+        .withColumn("Weekday_Avg_Transactions", F.avg("Transaction_Count").over(day_window))
         .withColumn(
-            "weekday_index100",
-            F.when(
-                F.col("day_avg_across_segments") > 0,
-                F.col("purchases_count") / F.col("day_avg_across_segments") * 100.0,
-            ).otherwise(F.lit(0.0)),
+            "Weekday_Index_100",
+            F.when(F.col("Weekday_Avg_Transactions") > 0, F.col("Transaction_Count") / F.col("Weekday_Avg_Transactions") * 100.0).otherwise(F.lit(0.0)),
         )
-        .drop("day_avg_across_segments")
-        .orderBy("club_member_status", "day_of_week")
+        .drop("Weekday_Avg_Transactions")
+        .orderBy("Club_Member_Status", "Weekday_Name")
+        .limit(14)
     )
-
-
-def _append_explain_log(df: DataFrame, header: str, log_file: str) -> None:
-    from contextlib import redirect_stdout
-
-    buf = io.StringIO()
-
-    with redirect_stdout(buf):
-        df.explain(extended=True)
-    with open(log_file, "a", encoding="utf-8") as fh:
-        fh.write(f"\n{'=' * 90}\n{header}\n{'=' * 90}\n")
-        fh.write(buf.getvalue())
-
-
-def _save_csv(df: DataFrame, output_dir: str) -> None:
-    df.coalesce(1).write.mode("overwrite").option("header", True).csv(output_dir)
-
-
-def _plot_query_1(df: pd.DataFrame, output_path: str) -> None:
-    df = df.copy()
-    df["year_week"] = df["year"].astype(str) + "-W" + df["week"].astype(str).str.zfill(2)
-    plt.figure(figsize=(14, 6), dpi=300)
-    sns.lineplot(data=df, x="year_week", y="transactions_count", marker="o", linewidth=2)
-    plt.title("Weekly Transaction Dynamics Across the Full Period")
-    plt.xlabel("Year-Week")
-    plt.ylabel("Transaction Count")
-    step = max(1, len(df) // 16)
-    tick_positions = list(range(0, len(df), step))
-    tick_labels = [df.iloc[pos]["year_week"] for pos in tick_positions]
-    plt.xticks(tick_positions, tick_labels, rotation=45, ha="right")
-    plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close()
-
-
-def _plot_query_2(df: pd.DataFrame, output_path: str) -> None:
-    ordered = df.sort_values("sales_spike", ascending=False).head(12)
-    y_pos = range(len(ordered))
-    plt.figure(figsize=(12, 7), dpi=300)
-    plt.hlines(
-        y=y_pos,
-        xmin=ordered["summer_sales"],
-        xmax=ordered["winter_sales"],
-        color="gray",
-        alpha=0.7,
+    return round_existing(result_df, {"Segment_Day_Share_Pct": 2, "Weekday_Index_100": 2}).select(
+        F.col("Club_Member_Status").alias("Статус_клубного_членства"),
+        F.col("Weekday_Name").alias("День_тижня"),
+        F.col("Transaction_Count").alias("Кількість_транзакцій"),
+        F.col("Segment_Total_Transactions").alias("Загальна_кількість_транзакцій_за_статусом"),
+        F.col("Segment_Day_Share_Pct").alias("Частка_від_транзакцій_даного_статусу_(відсоток)"),
+        F.col("Weekday_Index_100").alias("Індекс_відносно_середнього_рівня_дня_тижня_(відсоток)"),
     )
-    plt.scatter(ordered["summer_sales"], y_pos, color="#4c72b0", label="Summer")
-    plt.scatter(ordered["winter_sales"], y_pos, color="#dd8452", label="Winter")
-    plt.yticks(y_pos, ordered["product_group_name"])
-    plt.title("Winter vs Summer Sales Spike by Product Group")
-    plt.xlabel("Sales Count")
-    plt.ylabel("Product Group")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close()
-
-
-def _plot_query_3(df: pd.DataFrame, output_path: str) -> None:
-    prepared = _prepare_query_3_plot_data(df)
-
-    plt.figure(figsize=(12, 6), dpi=300)
-    sns.barplot(data=prepared, x="bucket_label", y="customers_count", color="#4c72b0")
-    plt.title("Retention Gap Between 1st and 2nd Purchase (Bucketed)")
-    plt.xlabel("Days Between Purchases (Buckets)")
-    plt.ylabel("Customer Count")
-    plt.xticks(rotation=25, ha="right")
-    for idx, row in prepared.iterrows():
-        plt.text(
-            idx,
-            row["customers_count"],
-            f"{row['customers_share_pct']:.1f}%",
-            ha="center",
-            va="bottom",
-            fontsize=8,
-        )
-    plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close()
-
-
-def _plot_query_4(df: pd.DataFrame, output_path: str) -> None:
-    ordered = df.sort_values("t_dat")
-    plt.figure(figsize=(12, 6), dpi=300)
-    sns.lineplot(data=ordered, x="t_dat", y="daily_revenue", marker="o", linewidth=2)
-    for _, row in ordered.iterrows():
-        plt.annotate(
-            f"{row['monthly_share']:.1%}",
-            (row["t_dat"], row["daily_revenue"]),
-            xytext=(0, 7),
-            textcoords="offset points",
-            ha="center",
-            fontsize=7,
-        )
-    plt.title("Top 10 Daily Sales Peaks and Their Monthly Share")
-    plt.xlabel("Date")
-    plt.ylabel("Daily Transaction Count")
-    plt.xticks(rotation=45, ha="right")
-    plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close()
-
-
-def _plot_query_5(df: pd.DataFrame, output_path: str) -> None:
-    plt.figure(figsize=(12, 6), dpi=300)
-    sns.lineplot(data=df, x="t_dat", y="purchases_count", label="Daily Purchases", alpha=0.5)
-    sns.lineplot(data=df, x="t_dat", y="rolling_avg_7d", label="7-Day Rolling Average", linewidth=2)
-    if {"lower_band_2sigma", "upper_band_2sigma"} <= set(df.columns):
-        plt.fill_between(
-            df["t_dat"],
-            df["lower_band_2sigma"],
-            df["upper_band_2sigma"],
-            color="#4c72b0",
-            alpha=0.15,
-            label="2σ Band",
-        )
-    if "is_outlier" in df.columns:
-        outlier_mask = df["is_outlier"].astype(bool)
-        outliers = df[outlier_mask]
-        if not outliers.empty:
-            plt.scatter(
-                outliers["t_dat"],
-                outliers["purchases_count"],
-                color="#d62728",
-                s=25,
-                label="Outlier",
-                zorder=5,
-            )
-    plt.title("7-Day Rolling Purchase Activity for Customers Aged 30-40")
-    plt.xlabel("Date")
-    plt.ylabel("Purchases")
-    plt.xticks(rotation=45, ha="right")
-    plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close()
-
-
-def _plot_query_6(df: pd.DataFrame, output_path: str) -> None:
-    weekday_names = {
-        1: "Sun",
-        2: "Mon",
-        3: "Tue",
-        4: "Wed",
-        5: "Thu",
-        6: "Fri",
-        7: "Sat",
-    }
-    pivot = (
-        df.pivot(index="day_of_week", columns="club_member_status", values="segment_day_share_pct")
-        .fillna(0)
-        .sort_index()
-    )
-    pivot.index = [weekday_names.get(int(idx), str(idx)) for idx in pivot.index]
-    plt.figure(figsize=(10, 6), dpi=300)
-    sns.heatmap(pivot, annot=True, fmt=".1f", cmap="Blues")
-    plt.title("Within-Segment Purchase Share by Weekday: ACTIVE vs PRE-CREATE")
-    plt.xlabel("Club Member Status")
-    plt.ylabel("Day of Week")
-    plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close()
-
-
-def _run_query_pipeline(
-    query_name: str,
-    query_df: DataFrame,
-    csv_output_dir: str,
-    explain_log_file: str,
-    plot_output_file: str,
-    plot_func: Callable[[pd.DataFrame, str], None],
-) -> None:
-    _append_explain_log(query_df, query_name, explain_log_file)
-    _save_csv(query_df, csv_output_dir)
-    plot_df = query_df
-    for field in query_df.schema.fields:
-        if isinstance(field.dataType, BooleanType):
-            plot_df = plot_df.withColumn(field.name, F.col(field.name).cast("int"))
-    plot_func(plot_df.toPandas(), plot_output_file)
 
 
 def run(
@@ -504,70 +469,22 @@ def run(
     processed_dir: str = "data/processed",
     output_root: str = "output/dmytro",
 ) -> None:
-    """Execute all 6 Dmytro transformation queries and write outputs."""
-    sns.set_theme(style="whitegrid", palette="muted")
+    directories = ensure_output_dirs(output_root)
+    initialize_explain_log(
+        os.path.join(directories["logs"], "explain_logs.txt"),
+        "Dmytro transformation query explain logs",
+    )
 
-    csv_root = os.path.join(output_root, "csv")
-    plots_root = os.path.join(output_root, "plots")
-    logs_root = os.path.join(output_root, "logs")
-    os.makedirs(csv_root, exist_ok=True)
-    os.makedirs(plots_root, exist_ok=True)
-    os.makedirs(logs_root, exist_ok=True)
+    transactions = load_parquet_dataset(spark, processed_dir, "transactions")
+    articles = load_parquet_dataset(spark, processed_dir, "articles")
+    customers = load_parquet_dataset(spark, processed_dir, "customers")
 
-    explain_log_file = os.path.join(logs_root, "explain_logs.txt")
-    with open(explain_log_file, "w", encoding="utf-8") as fh:
-        fh.write("Dmytro Transformation Query Explain Logs\n")
-
-    transactions = spark.read.parquet(os.path.join(processed_dir, "transactions"))
-    articles = spark.read.parquet(os.path.join(processed_dir, "articles"))
-    customers = spark.read.parquet(os.path.join(processed_dir, "customers"))
-    transactions = transactions.repartition("customer_id").cache()
-    transactions.count()
-
-    query_outputs: list[tuple[str, DataFrame, Callable[[pd.DataFrame, str], None]]] = [
-        (
-            "Query 1 - Weekly transaction dynamics",
-            query_1_weekly_transaction_dynamics(transactions),
-            _plot_query_1,
-        ),
-        (
-            "Query 2 - Winter vs summer spike by product group",
-            query_2_winter_vs_summer_spike(transactions, articles),
-            _plot_query_2,
-        ),
-        (
-            "Query 3 - Retention gap between first and second purchase",
-            query_3_retention_gap_distribution(transactions),
-            _plot_query_3,
-        ),
-        (
-            "Query 4 - Top peak days and monthly share",
-            query_4_top_peak_days_month_share(transactions),
-            _plot_query_4,
-        ),
-        (
-            "Query 5 - 7-day rolling activity for age 30-40",
-            query_5_rolling_activity_30_40(transactions, customers),
-            _plot_query_5,
-        ),
-        (
-            "Query 6 - Frequency ACTIVE vs PRE-CREATE",
-            query_6_frequency_loyal_vs_guest(transactions, customers),
-            _plot_query_6,
-        ),
-    ]
-
-    for idx, (title, query_df, plot_func) in enumerate(query_outputs, start=1):
-        _run_query_pipeline(
-            query_name=title,
-            query_df=query_df,
-            csv_output_dir=os.path.join(csv_root, f"query_{idx}"),
-            explain_log_file=explain_log_file,
-            plot_output_file=os.path.join(plots_root, f"query_{idx}.png"),
-            plot_func=plot_func,
-        )
-
-    transactions.unpersist()
+    save_report(query_1_weekly_transaction_dynamics(transactions), "Query 1 - Quarterly transaction and revenue report by channel", "query_1", directories)
+    save_report(query_2_winter_vs_summer_spike(transactions, articles), "Query 2 - Winter versus summer report by product group and index group", "query_2", directories)
+    save_report(query_3_retention_gap_distribution(transactions, customers), "Query 3 - Retention bucket report by age group", "query_3", directories)
+    save_report(query_4_top_peak_days_month_share(transactions), "Query 4 - Quarterly peak-day report by channel", "query_4", directories)
+    save_report(query_5_rolling_activity_30_40(transactions, customers), "Query 5 - Weekday activity anomaly summary for ages 30-40", "query_5", directories)
+    save_report(query_6_frequency_loyal_vs_guest(transactions, customers), "Query 6 - Weekday purchase-share report by club member status", "query_6", directories)
 
 
 if __name__ == "__main__":
