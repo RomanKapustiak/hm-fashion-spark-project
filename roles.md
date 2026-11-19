@@ -19,32 +19,33 @@ This document records the initial distribution of roles and the project stages f
 ## Project Stages and Role Distribution
 
 ### 1) Preparation Stage
-- Roman: Repository initialization, master/develop branch configuration.
+- Roman: Repository initialization, main/dev branch configuration.
 - Yura: Local project structure setup and `.gitignore` configuration.
 - Artem: Dataset preview — data type identification and initial feature selection.
 - Taras: Dataset acquisition and local data integrity verification.
 - Dmytro: Initial documentation and `roles.md` file preparation.
 
-### 2) Configuration Stage (Common Tasks)
-All team members share responsibility for environment setup and verification:
-- Install Python 3.8 and required IDEs
-- Configure PySpark and Java 11
-- Install and verify Docker
-- Build project Docker image and run the basic SparkSession smoke test
+### 2) Configuration Stage
+All team members install and verify Docker locally. Individual contributions:
+- Roman: `Dockerfile` and Docker Compose setup, guide for running PySpark scripts and notebooks.
+- Yura: Automation — Kaggle API script for downloading and unpacking the data into `data/raw`.
+- Taras: Presentation — template, domain description, progress of stages 1–2.
+- Artem: Presentation — content, progress visualization and analytics.
+- Dmytro: Report update, Docker verification (screenshots), documentation of roles and technical description.
 
 ### 3) Extraction Stage
-- Taras: StructType schema for article identification/hierarchy (`articles.csv`).
-- Yura: StructType schema for visual/descriptive attributes (`articles.csv`).
-- Artem: StructType schema for customer metadata (`customers.csv`).
-- Roman: StructType schema for transaction records (`transactions_train.csv`).
-- Dmytro: Implement `data_loader` module and centralized DataFrame readers.
+- Roman: StructType schema and loading module for `transactions_train.csv`.
+- Yura: StructType schema and correctly typed loading of `customers.csv`.
+- Dmytro: StructType schema and correctly typed loading of `articles.csv`.
+- Taras: Testing of the extraction flow, verification that all three tables load into memory.
+- Artem: Code review of the loading logic, data integrity checks after loading into PySpark.
 
 ### 4) Data Preprocessing Stage
-- Taras: Article cleaning (duplicates, case normalization).
-- Yura: Description cleaning (null handling, color normalization).
-- Artem: Customer cleaning (age imputation, status normalization).
-- Roman: Financial validation (price outliers, type casting).
-- Dmytro: Statistical analysis and removal of non-informative features.
+- Roman: Transactions cleaning pipeline — type casting (dates, identifiers), missing values, duplicate analysis of purchase history.
+- Yura: Customers — text normalization, informativeness analysis of demographic features, null handling (age, club status).
+- Dmytro: Articles pipeline — statistics, type casting, text normalization, deduplication by `article_id`.
+- Taras: Analysis of cleaning results, structuring the report according to the project requirements.
+- Artem: Analysis of cleaning results, adding preprocessing results to the presentation.
 
 ### 5) Transformation Stage
 Each member implements 6 business queries and provides an execution plan analysis (`.explain()`):
@@ -56,23 +57,39 @@ Each member implements 6 business queries and provides an execution plan analysi
 
 Requirements per member: at least 3 filters, 2 joins, 2 group-bys, 2 window functions, plus query plan analysis.
 
-### 6) Results Writing Stage
-- Taras: Export product analytics to CSV
+### 6) Data Analysis Stage (Regression & Classification Models)
+Two shared tasks on shared feature tables with a shared train/test split (`src/analysis/`):
+- Classification: will a customer buy anything during the next 4 weeks?
+- Regression: average price of an article from its characteristics.
+
+Each member owns one algorithm family and applies it to both tasks:
+- Roman: Linear models — `LinearRegression`, `LogisticRegression`. Shared foundation: feature tables, split, preprocessing, tuning and evaluation utilities, fix of customer null handling.
+- Taras: Decision tree — `DecisionTreeRegressor`, `DecisionTreeClassifier`. Comparison of all models and conclusions.
+- Artem: Random forest — `RandomForestRegressor`, `RandomForestClassifier`. Presentation of the stage.
+- Dmytro: Gradient-boosted trees — `GBTRegressor`, `GBTClassifier`. Report section for the stage.
+- Yura: Factorization machines — `FMRegressor`, `FMClassifier`. Re-run of business queries affected by the customer data fix.
+
+Requirements per member: hyper-parameter tuning, analysis of the training process, test metrics (RMSE, R² / Accuracy, Precision, Recall, F1), comparison against a trivial baseline.
+
+### 7) Results Writing Stage
+- Taras: Export product analytics to CSV; model comparison tables (`output/ml/comparison/`)
 - Yura: Export design/trend analytics to CSV
 - Artem: Export customer segmentation to CSV
 - Roman: Export financial reports and sales-channel analytics to CSV
 - Dmytro: Validate pipeline outputs and ensure CSV storage in Docker
+- All members: model metrics, tuning results and training plots to `output/ml/<member>/`
 
-### 7) Presentation Stage
+### 8) Presentation Stage
 - Team presentation of findings and pipeline demonstration (shared responsibility).
+- Data analysis stage slides: Artem (each member provides material about their model).
 
 ---
 
 ## Development & Coding Standards (brief)
 - Follow PEP 8 and include type hints for public functions.
 - Use `pytest` for unit tests and place tests in `tests/`.
-- Use the local virtual environment: `source venv/bin/activate`.
-- Use `./venv/bin/python` if activation is not persistent.
+- Run code and tests in Docker: `docker compose run --rm spark-app python -m pytest`.
+- Work in `feature/*` branches created from `dev`; open pull requests into `dev`, merge `dev` into `main` at the end of a stage.
 - Keep `requirements.txt` updated (`pip freeze > requirements.txt`).
 
 ---
