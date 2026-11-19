@@ -1,4 +1,4 @@
-from pyspark.sql.functions import col, isnan, count, when
+from pyspark.sql.functions import col, isnan, count, when, upper, trim
 from pyspark.sql.types import IntegerType, DoubleType
 
 def _step1_general_stats(df):
@@ -75,21 +75,36 @@ def _step4_feature_info(df):
 def _step5_nulls_and_dups(df):
     print("step 5 - nulls and duplicates")
     before_count = df.count()
-    
+
     # Count nulls per column
     print("Null counts per column:")
     df.select([count(when(col(c).isNull() | isnan(col(c)), c)).alias(c) for c in df.columns]).show()
-    
-    # Drop rows with any null
-    df = df.dropna()
+
+    # FN / Active are flags: an empty value means "not subscribed" / "not active",
+    # not a missing value, so dropping such rows would throw away ~2/3 of customers.
+    flag_cols = [c for c in ("FN", "Active") if c in df.columns]
+    if flag_cols:
+        df = df.fillna(0.0, subset=flag_cols)
+
+    # categorical fields: unify spelling ("NONE" vs "None") and mark missing values explicitly
+    for c in ("club_member_status", "fashion_news_frequency"):
+        if c in df.columns:
+            df = df.withColumn(c, upper(trim(col(c))))
+            df = df.withColumn(c, when(col(c).isNull() | (col(c) == ""), "UNKNOWN").otherwise(col(c)))
+
+    # age is kept nullable (~1% of rows): customers without age are still valid buyers;
+    # downstream code buckets them as "Unknown" or imputes the value
+    # only rows without an identifier are useless
+    if "customer_id" in df.columns:
+        df = df.dropna(subset=["customer_id"])
     after_nulls = df.count()
-    
+
     # keeping duplicates exactly as the instructions say doing nothing about them
-    
+
     print("Count before processing: {}".format(before_count))
-    print("Count after dropping nulls: {}".format(after_nulls))
+    print("Count after null handling: {}".format(after_nulls))
     print("Duplicates were kept on purpose because repeating rows are legitimate for this domain.")
-    
+
     return df
 
 def run_preprocessing(df):
