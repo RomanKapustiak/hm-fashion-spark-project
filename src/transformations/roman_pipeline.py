@@ -1,27 +1,11 @@
-"""Roman financial performance transformation pipeline.
-
-Run inside Docker with:
-python src/transformations/roman_pipeline.py
-"""
+"""Roman financial performance transformation pipeline."""
 
 from __future__ import annotations
 
-import contextlib
-import io
-import math
 import os
 import sys
 from typing import Dict
 
-import matplotlib
-
-matplotlib.use("Agg")
-
-import matplotlib.pyplot as plt
-import pandas as pd
-import seaborn as sns
-from matplotlib.patches import Circle
-from matplotlib.ticker import FuncFormatter
 from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 
@@ -30,505 +14,395 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from src.spark_utils import create_spark_session
-
+from src.transformations.report_utils import (
+    build_age_group_expression,
+    build_channel_label_expression,
+    build_weekday_label_expression,
+    ensure_output_dirs,
+    initialize_explain_log,
+    load_parquet_dataset,
+    recommended_partitions,
+    round_existing,
+    save_report,
+)
 
 MEMBER_NAME = "roman"
-MAX_PANDAS_ROWS = 5000
-MIN_PARTITIONS = 8
-CHANNEL_LABELS = {
-    1: "Store",
-    2: "Online",
-}
-WEEKDAY_LABELS = {
-    1: "Sunday",
-    2: "Monday",
-    3: "Tuesday",
-    4: "Wednesday",
-    5: "Thursday",
-    6: "Friday",
-    7: "Saturday",
-}
 
 
-sns.set_theme(style="whitegrid", palette="muted")
-
-
-def _build_channel_label_expression() -> F.Column:
-    column = F.when(F.col("sales_channel_id") == F.lit(1), F.lit(CHANNEL_LABELS[1]))
-    column = column.when(F.col("sales_channel_id") == F.lit(2), F.lit(CHANNEL_LABELS[2]))
-    return column.otherwise(F.concat(F.lit("Channel "), F.col("sales_channel_id").cast("string")))
-
-
-def _build_weekday_label_expression() -> F.Column:
-    column = None
-    for weekday_number, weekday_name in WEEKDAY_LABELS.items():
-        if column is None:
-            column = F.when(F.col("weekday_num") == F.lit(weekday_number), F.lit(weekday_name))
-        else:
-            column = column.when(F.col("weekday_num") == F.lit(weekday_number), F.lit(weekday_name))
-
-    return column.otherwise(F.lit("Unknown"))
-
-
-def _ensure_output_dirs(output_dir: str) -> Dict[str, str]:
-    csv_dir = os.path.join(output_dir, "csv")
-    plots_dir = os.path.join(output_dir, "plots")
-    logs_dir = os.path.join(output_dir, "logs")
-
-    for directory in (output_dir, csv_dir, plots_dir, logs_dir):
-        os.makedirs(directory, exist_ok=True)
-
-    return {
-        "base": output_dir,
-        "csv": csv_dir,
-        "plots": plots_dir,
-        "logs": logs_dir,
-    }
-
-
-def _recommended_partitions(spark: SparkSession) -> int:
-    return max(spark.sparkContext.defaultParallelism, MIN_PARTITIONS)
-
-
-def _load_parquet_dataset(spark: SparkSession, processed_dir: str, dataset_name: str) -> DataFrame:
-    path = os.path.join(processed_dir, dataset_name)
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Processed dataset not found: {path}")
-    return spark.read.parquet(path)
-
-
-def _write_explain_log(df: DataFrame, log_path: str, question_label: str) -> None:
-    buffer = io.StringIO()
-    with contextlib.redirect_stdout(buffer):
-        df.explain(extended=True)
-
-    with open(log_path, "a", encoding="utf-8") as log_file:
-        log_file.write(f"\n{'=' * 100}\n")
-        log_file.write(f"{question_label}\n")
-        log_file.write(f"{'=' * 100}\n")
-        log_file.write(buffer.getvalue().rstrip())
-        log_file.write("\n")
-
-
-def _save_csv(df: DataFrame, csv_dir: str, output_name: str) -> None:
-    output_path = os.path.join(csv_dir, output_name)
-    (
-        df.coalesce(1)
-        .write
-        .mode("overwrite")
-        .option("header", True)
-        .csv(output_path)
-    )
-
-
-def _to_small_pandas(df: DataFrame, output_name: str, max_rows: int = MAX_PANDAS_ROWS) -> pd.DataFrame:
-    row_count = df.count()
-    if row_count > max_rows:
-        raise ValueError(
-            f"Refusing to convert '{output_name}' to pandas because it has {row_count} rows "
-            f"(limit: {max_rows})."
-        )
-    return df.toPandas()
-
-
-def _finalize_figure(fig: plt.Figure, path: str) -> None:
-    fig.tight_layout()
-    fig.savefig(path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _save_no_data_plot(path: str, title: str, message: str = "No data available for this question.") -> None:
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.axis("off")
-    ax.text(0.5, 0.5, message, ha="center", va="center", fontsize=16, color="#4c566a")
-    ax.set_title(title, fontsize=16, weight="bold")
-    _finalize_figure(fig, path)
-
-
-def _execute_output_bundle(
-    df: DataFrame,
-    question_label: str,
-    output_name: str,
-    directories: Dict[str, str],
-    plotter,
-) -> None:
-    _write_explain_log(df, os.path.join(directories["logs"], "explain_logs.txt"), question_label)
-    _save_csv(df, directories["csv"], output_name)
-    pandas_df = _to_small_pandas(df, output_name)
-    plot_path = os.path.join(directories["plots"], f"{output_name}.png")
-    plotter(pandas_df, plot_path)
-
-
-def _plot_q1_revenue_share(pdf: pd.DataFrame, plot_path: str) -> None:
-    title = "Revenue Share by Sales Channel Across Product Index Groups"
-    if pdf.empty:
-        _save_no_data_plot(plot_path, title)
-        return
-
-    plot_df = pdf.copy()
-    plot_df["channel_name"] = plot_df["channel_name"].fillna("Unknown")
-    plot_df["index_group_name"] = plot_df["index_group_name"].fillna("Unknown").str.title()
-
-    pivot_df = (
-        plot_df.pivot_table(
-            index="index_group_name",
-            columns="channel_name",
-            values="total_revenue",
-            aggfunc="sum",
-            fill_value=0.0,
-        )
-        .reindex(columns=["Store", "Online"], fill_value=0.0)
-    )
-
-    shares = pivot_df.div(pivot_df.sum(axis=1).replace(0, pd.NA), axis=0).fillna(0.0)
-    shares = shares.sort_values(by=["Online", "Store"], ascending=False)
-
-    fig, ax = plt.subplots(figsize=(14, 7))
-    colors = ["#6C8EBF", "#E07A5F"]
-    shares.plot(
-        kind="bar",
-        stacked=True,
-        ax=ax,
-        width=0.8,
-        color=colors[: len(shares.columns)],
-    )
-    ax.set_title(title, fontsize=16, weight="bold")
-    ax.set_xlabel("Index Group Name")
-    ax.set_ylabel("Revenue Share")
-    ax.set_ylim(0, 1)
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:.0%}"))
-    ax.legend(title="Sales Channel")
-    ax.tick_params(axis="x", rotation=30)
-    _finalize_figure(fig, plot_path)
-
-
-def _plot_q2_weekday_radar(pdf: pd.DataFrame, plot_path: str) -> None:
-    title = "Average Revenue by Day of Week"
-    if pdf.empty:
-        _save_no_data_plot(plot_path, title)
-        return
-
-    ordered = pdf.sort_values("weekday_num").reset_index(drop=True)
-    labels = ordered["weekday_name"].tolist()
-    values = ordered["avg_revenue"].astype(float).tolist()
-
-    angles = [index / float(len(labels)) * 2 * math.pi for index in range(len(labels))]
-    angles += angles[:1]
-    values += values[:1]
-
-    fig, ax = plt.subplots(figsize=(10, 10), subplot_kw={"polar": True})
-    ax.plot(angles, values, color="#5B8E7D", linewidth=2.5)
-    ax.fill(angles, values, color="#5B8E7D", alpha=0.25)
-    ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(labels)
-    ax.set_title(title, fontsize=16, weight="bold", pad=20)
-    ax.set_rlabel_position(0)
-    _finalize_figure(fig, plot_path)
-
-
-def _plot_q3_donut(pdf: pd.DataFrame, plot_path: str) -> None:
-    title = "Revenue Share of Top 10 Most Popular Products vs Rest in 2019"
-    if pdf.empty:
-        _save_no_data_plot(plot_path, title)
-        return
-
-    plot_df = pdf.copy()
-    plot_df["assortment_segment"] = plot_df["assortment_segment"].fillna("Unknown")
-
-    fig, ax = plt.subplots(figsize=(10, 7))
-    colors = ["#4C78A8", "#F58518"]
-    wedges, texts, autotexts = ax.pie(
-        plot_df["segment_revenue"],
-        labels=plot_df["assortment_segment"],
-        autopct="%1.1f%%",
-        startangle=90,
-        colors=colors[: len(plot_df)],
-        pctdistance=0.8,
-        wedgeprops={"linewidth": 1, "edgecolor": "white"},
-    )
-    centre_circle = Circle((0, 0), 0.55, fc="white")
-    ax.add_artist(centre_circle)
-    for autotext in autotexts:
-        autotext.set_color("black")
-        autotext.set_fontsize(11)
-    ax.set_title(title, fontsize=16, weight="bold")
-    _finalize_figure(fig, plot_path)
-
-
-def _plot_q4_growth_rate(pdf: pd.DataFrame, plot_path: str) -> None:
-    title = "Month-over-Month Revenue Growth Rate"
-    if pdf.empty:
-        _save_no_data_plot(plot_path, title)
-        return
-
-    plot_df = pdf.dropna(subset=["growth_rate_pct"]).copy()
-    if plot_df.empty:
-        _save_no_data_plot(plot_path, title, "Growth rate cannot be calculated because no prior month exists.")
-        return
-
-    plot_df["month_label"] = pd.to_datetime(plot_df["month_start"]).dt.strftime("%Y-%m")
-    colors = plot_df["growth_rate_pct"].apply(lambda value: "#2A9D8F" if value >= 0 else "#D1495B")
-
-    fig, ax = plt.subplots(figsize=(14, 7))
-    ax.bar(plot_df["month_label"], plot_df["growth_rate_pct"], color=colors)
-    ax.axhline(0, color="#1f2933", linewidth=1)
-    ax.set_title(title, fontsize=16, weight="bold")
-    ax.set_xlabel("Month")
-    ax.set_ylabel("Growth Rate (%)")
-    ax.tick_params(axis="x", rotation=45)
-    _finalize_figure(fig, plot_path)
-
-
-def _plot_q5_kpi_card(pdf: pd.DataFrame, plot_path: str) -> None:
-    title = "Average Check for Customers Receiving Fashion News Regularly"
-    if pdf.empty:
-        _save_no_data_plot(plot_path, title)
-        return
-
-    row = pdf.iloc[0]
-    avg_check_value = float(row["avg_check_value"]) if pd.notna(row["avg_check_value"]) else 0.0
-    transaction_count = int(row["transaction_count"]) if pd.notna(row["transaction_count"]) else 0
-    customer_count = int(row["customer_count"]) if pd.notna(row["customer_count"]) else 0
-
-    fig, ax = plt.subplots(figsize=(11, 5))
-    ax.axis("off")
-    fig.patch.set_facecolor("#F7F7F7")
-    ax.text(0.5, 0.82, title, ha="center", va="center", fontsize=18, weight="bold", color="#264653")
-    ax.text(0.5, 0.48, f"{avg_check_value:.4f}", ha="center", va="center", fontsize=34, weight="bold", color="#2A9D8F")
-    ax.text(0.5, 0.29, "Average Transaction Price", ha="center", va="center", fontsize=14, color="#5C677D")
-    ax.text(
-        0.5,
-        0.12,
-        f"Based on {transaction_count:,} transactions across {customer_count:,} customers",
-        ha="center",
-        va="center",
-        fontsize=12,
-        color="#5C677D",
-    )
-    _finalize_figure(fig, plot_path)
-
-
-def _plot_q6_running_total(pdf: pd.DataFrame, plot_path: str) -> None:
-    title = "Running Total Revenue in 2019 by Sales Channel"
-    if pdf.empty:
-        _save_no_data_plot(plot_path, title)
-        return
-
-    plot_df = pdf.copy()
-    plot_df["t_dat"] = pd.to_datetime(plot_df["t_dat"])
-
-    fig, ax = plt.subplots(figsize=(14, 7))
-    sns.lineplot(
-        data=plot_df,
-        x="t_dat",
-        y="running_total_revenue",
-        hue="channel_name",
-        linewidth=2.5,
-        ax=ax,
-    )
-    ax.set_title(title, fontsize=16, weight="bold")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Running Total Revenue")
-    ax.tick_params(axis="x", rotation=30)
-    ax.legend(title="Sales Channel")
-    _finalize_figure(fig, plot_path)
-
-
+# Питання: Які 10 сегментів за глобальною товарною групою та каналом продажу забезпечують найвищі показники виручки, середньої ціни та частки каналу?
+# Опис колонок:
+# - Глобальна_товарна_група: Назва глобальної товарної групи.
+# - Канал_продажу: Назва каналу продажу.
+# - Кількість_транзакцій: Загальна кількість транзакцій у сегменті.
+# - Загальна_виручка: Загальна виручка у сегменті.
+# - Середня_ціна_товару: Середня ціна покупки у сегменті.
+# - Частка_від_виручки_глобальної_групи_(відсоток): Частка виручки каналу в межах даної глобальної товарної групи.
 def _question_1(
     transactions_df: DataFrame,
     articles_df: DataFrame,
     directories: Dict[str, str],
     partition_count: int,
 ) -> None:
+    share_window = Window.partitionBy("Index_Group_Name")
+
     final_df = (
         transactions_df
         .repartition(partition_count, "article_id")
-        .alias("transactions")
-        .join(F.broadcast(articles_df).alias("articles"), on="article_id", how="inner")
-        .withColumn("index_group_name", F.coalesce(F.col("index_group_name"), F.lit("unknown")))
-        .groupBy("index_group_name", "sales_channel_id")
-        .agg(F.sum("price").alias("total_revenue"))
-        .withColumn("channel_name", _build_channel_label_expression())
-        .select("index_group_name", "sales_channel_id", "channel_name", "total_revenue")
-        .orderBy("index_group_name", "sales_channel_id")
+        .filter(F.col("price") > 0)
+        .join(articles_df.select("article_id", "index_group_name"), on="article_id", how="inner")
+        .withColumn("Index_Group_Name", F.initcap(F.coalesce(F.trim(F.col("index_group_name")), F.lit("Unknown"))))
+        .withColumn("Channel_Name", build_channel_label_expression())
+        .groupBy("Index_Group_Name", "Channel_Name")
+        .agg(
+            F.count("*").alias("Transaction_Count"),
+            F.sum("price").alias("Total_Revenue"),
+            F.avg("price").alias("Avg_Price"),
+        )
+        .withColumn("Index_Group_Revenue", F.sum("Total_Revenue").over(share_window))
+        .withColumn(
+            "Revenue_Share_Pct",
+            F.when(
+                F.col("Index_Group_Revenue") > 0,
+                F.col("Total_Revenue") / F.col("Index_Group_Revenue") * 100.0,
+            ).otherwise(F.lit(0.0)),
+        )
+        .drop("Index_Group_Revenue")
+        .orderBy(F.desc("Total_Revenue"), "Index_Group_Name", "Channel_Name")
+        .limit(10)
     )
 
-    _execute_output_bundle(
-        df=final_df,
-        question_label="Question 1: Revenue by sales channel and index group",
-        output_name="q1_revenue_by_index_group_channel",
-        directories=directories,
-        plotter=_plot_q1_revenue_share,
+    final_df = round_existing(final_df, {"Total_Revenue": 2, "Avg_Price": 4, "Revenue_Share_Pct": 2}).select(
+        F.col("Index_Group_Name").alias("Глобальна_товарна_група"),
+        F.col("Channel_Name").alias("Канал_продажу"),
+        F.col("Transaction_Count").alias("Кількість_транзакцій"),
+        F.col("Total_Revenue").alias("Загальна_виручка"),
+        F.col("Avg_Price").alias("Середня_ціна_товару"),
+        F.col("Revenue_Share_Pct").alias("Частка_від_виручки_глобальної_групи_(відсоток)"),
+    )
+    save_report(
+        final_df,
+        "Question 1: Revenue, average price, and channel share by index group",
+        "q1_revenue_by_index_group_channel",
+        directories,
     )
 
 
-def _question_2(transactions_df: DataFrame, directories: Dict[str, str], partition_count: int) -> None:
-    ranking_window = Window.orderBy(F.desc("avg_revenue"), F.asc("weekday_num"))
+# Питання: Яким є фінансовий профіль у вибірці з 14 сегментів, сформованих за днями тижня та каналами продажу?
+# Опис колонок:
+# - Канал_продажу: Назва каналу продажу.
+# - День_тижня: Назва дня тижня.
+# - Кількість_транзакцій: Загальна кількість транзакцій у цей день тижня.
+# - Загальна_виручка: Загальна виручка у цей день тижня.
+# - Середня_ціна_товару: Середня ціна покупки у цей день тижня.
+# - Ранг_дня_за_виручкою_в_каналі: Позиція дня тижня за виручкою в межах каналу.
+def _question_2(
+    transactions_df: DataFrame,
+    directories: Dict[str, str],
+    partition_count: int,
+) -> None:
+    ranking_window = Window.partitionBy("Channel_Name").orderBy(F.desc("Total_Revenue"), F.asc("Weekday_Num"))
 
     final_df = (
         transactions_df
         .repartition(partition_count, "t_dat")
-        .filter(F.col("price") > F.lit(0.01))
-        .withColumn("weekday_num", F.dayofweek("t_dat"))
-        .withColumn("weekday_name", _build_weekday_label_expression())
-        .groupBy("weekday_num", "weekday_name")
-        .agg(F.avg("price").alias("avg_revenue"))
-        .withColumn("revenue_rank", F.dense_rank().over(ranking_window))
-        .orderBy("revenue_rank", "weekday_num")
+        .filter(F.col("t_dat").isNotNull())
+        .filter(F.col("price") > 0.01)
+        .withColumn("Weekday_Num", F.dayofweek("t_dat"))
+        .withColumn("Weekday_Name", build_weekday_label_expression("Weekday_Num"))
+        .withColumn("Channel_Name", build_channel_label_expression())
+        .groupBy("Weekday_Num", "Weekday_Name", "Channel_Name")
+        .agg(
+            F.count("*").alias("Transaction_Count"),
+            F.sum("price").alias("Total_Revenue"),
+            F.avg("price").alias("Avg_Price"),
+        )
+        .withColumn("Revenue_Rank", F.dense_rank().over(ranking_window))
+        .orderBy("Channel_Name", "Revenue_Rank", "Weekday_Name")
+        .limit(14)
     )
 
-    _execute_output_bundle(
-        df=final_df,
-        question_label="Question 2: Average revenue ranking by day of week",
-        output_name="q2_weekday_avg_revenue_rank",
-        directories=directories,
-        plotter=_plot_q2_weekday_radar,
+    final_df = round_existing(final_df, {"Total_Revenue": 2, "Avg_Price": 4}).select(
+        F.col("Channel_Name").alias("Канал_продажу"),
+        F.col("Weekday_Name").alias("День_тижня"),
+        F.col("Transaction_Count").alias("Кількість_транзакцій"),
+        F.col("Total_Revenue").alias("Загальна_виручка"),
+        F.col("Avg_Price").alias("Середня_ціна_товару"),
+        F.col("Revenue_Rank").alias("Ранг_дня_за_виручкою_в_каналі"),
+    )
+    save_report(
+        final_df,
+        "Question 2: Financial profile of weekdays by sales channel",
+        "q2_weekday_avg_revenue_rank",
+        directories,
     )
 
 
+# Питання: Які 15 комбінацій товарних груп і секцій формують найвищі показники виручки у 2019 році?
+# Опис колонок:
+# - Товарна_група: Назва товарної групи.
+# - Секція: Назва секції одягу.
+# - Кількість_транзакцій: Загальна кількість транзакцій у сегменті.
+# - Загальна_виручка: Загальна виручка сегмента у 2019 році.
+# - Середня_ціна_товару: Середня ціна покупки у сегменті.
+# - Частка_від_виручки_товарної_групи_(відсоток): Частка виручки секції в межах товарної групи.
 def _question_3(
     transactions_df: DataFrame,
     articles_df: DataFrame,
     directories: Dict[str, str],
     partition_count: int,
 ) -> None:
-    product_metrics_df = (
+    share_window = Window.partitionBy("Product_Group_Name")
+
+    final_df = (
         transactions_df
         .repartition(partition_count, "article_id")
-        .alias("transactions")
-        .filter(F.year("t_dat") == F.lit(2019))
-        .join(F.broadcast(articles_df).alias("articles"), on="article_id", how="inner")
-        .withColumn("prod_name", F.coalesce(F.col("prod_name"), F.lit("unknown product")))
-        .groupBy("prod_name")
-        .agg(
-            F.count(F.lit(1)).alias("transaction_count"),
-            F.sum("price").alias("product_revenue"),
+        .filter(F.year("t_dat") == 2019)
+        .filter(F.col("price") > 0)
+        .join(
+            articles_df.select("article_id", "product_group_name", "section_name"),
+            on="article_id",
+            how="inner",
         )
-    )
-
-    top_products_df = (
-        product_metrics_df
-        .orderBy(F.desc("transaction_count"), F.desc("product_revenue"), F.asc("prod_name"))
-        .limit(10)
-        .select("prod_name")
-        .withColumn("is_top_10", F.lit(1))
-    )
-
-    final_df = (
-        product_metrics_df
-        .join(F.broadcast(top_products_df), on="prod_name", how="left")
+        .withColumn("Product_Group_Name", F.initcap(F.coalesce(F.trim(F.col("product_group_name")), F.lit("Unknown"))))
+        .withColumn("Section_Name", F.initcap(F.coalesce(F.trim(F.col("section_name")), F.lit("Unknown"))))
+        .groupBy("Product_Group_Name", "Section_Name")
+        .agg(
+            F.count("*").alias("Transaction_Count"),
+            F.sum("price").alias("Total_Revenue"),
+            F.avg("price").alias("Avg_Price"),
+        )
+        .filter(F.col("Transaction_Count") >= 100)
+        .withColumn("Product_Group_Revenue", F.sum("Total_Revenue").over(share_window))
         .withColumn(
-            "assortment_segment",
-            F.when(F.col("is_top_10") == F.lit(1), F.lit("Top 10 products"))
-            .otherwise(F.lit("Rest of assortment")),
+            "Revenue_Share_Pct",
+            F.when(
+                F.col("Product_Group_Revenue") > 0,
+                F.col("Total_Revenue") / F.col("Product_Group_Revenue") * 100.0,
+            ).otherwise(F.lit(0.0)),
         )
-        .groupBy("assortment_segment")
-        .agg(
-            F.sum("product_revenue").alias("segment_revenue"),
-            F.sum("transaction_count").alias("segment_transactions"),
-        )
-        .orderBy(F.desc("segment_revenue"))
+        .drop("Product_Group_Revenue")
+        .orderBy(F.desc("Total_Revenue"), "Product_Group_Name", "Section_Name")
+        .limit(15)
     )
 
-    total_revenue = final_df.agg(F.sum("segment_revenue").alias("total_revenue")).collect()[0]["total_revenue"] or 0.0
-    final_df = final_df.withColumn(
-        "revenue_share_pct",
-        F.when(F.lit(total_revenue) != 0, (F.col("segment_revenue") / F.lit(total_revenue)) * F.lit(100.0))
-        .otherwise(F.lit(0.0)),
+    final_df = round_existing(final_df, {"Total_Revenue": 2, "Avg_Price": 4, "Revenue_Share_Pct": 2}).select(
+        F.col("Product_Group_Name").alias("Товарна_група"),
+        F.col("Section_Name").alias("Секція"),
+        F.col("Transaction_Count").alias("Кількість_транзакцій"),
+        F.col("Total_Revenue").alias("Загальна_виручка"),
+        F.col("Avg_Price").alias("Середня_ціна_товару"),
+        F.col("Revenue_Share_Pct").alias("Частка_від_виручки_товарної_групи_(відсоток)"),
     )
-
-    _execute_output_bundle(
-        df=final_df,
-        question_label="Question 3: Revenue share of top 10 products versus the rest in 2019",
-        output_name="q3_top10_revenue_share_2019",
-        directories=directories,
-        plotter=_plot_q3_donut,
+    save_report(
+        final_df,
+        "Question 3: Revenue report by product group and section for 2019",
+        "q3_top10_revenue_share_2019",
+        directories,
     )
 
 
-def _question_4(transactions_df: DataFrame, directories: Dict[str, str], partition_count: int) -> None:
-    month_window = Window.orderBy("month_start")
+# Питання: Якими є зміни виручки та темпи її зростання у вибірці з 20 квартально-категорійних сегментів провідних глобальних товарних груп у 2019 році?
+# Опис колонок:
+# - Квартал_2019_року: Квартал 2019 року.
+# - Глобальна_товарна_група: Назва глобальної товарної групи.
+# - Кількість_транзакцій: Загальна кількість транзакцій у кварталі.
+# - Квартальна_виручка: Загальна виручка групи у кварталі.
+# - Виручка_попереднього_кварталу: Виручка цієї групи у попередньому кварталі.
+# - Темп_зростання_до_попереднього_кварталу_(відсоток): Темп зміни виручки відносно попереднього кварталу.
+def _question_4(
+    transactions_df: DataFrame,
+    articles_df: DataFrame,
+    directories: Dict[str, str],
+    partition_count: int,
+) -> None:
+    total_revenue_window = Window.orderBy(F.desc("Revenue_2019"))
+    quarter_window = Window.partitionBy("Index_Group_Name").orderBy("Quarter_Label")
+
+    top_groups_df = (
+        transactions_df
+        .repartition(partition_count, "article_id")
+        .filter(F.year("t_dat") == 2019)
+        .filter(F.col("price") > 0)
+        .join(articles_df.select("article_id", "index_group_name"), on="article_id", how="inner")
+        .withColumn("Index_Group_Name", F.initcap(F.coalesce(F.trim(F.col("index_group_name")), F.lit("Unknown"))))
+        .groupBy("Index_Group_Name")
+        .agg(F.sum("price").alias("Revenue_2019"))
+        .withColumn("Revenue_Rank", F.dense_rank().over(total_revenue_window))
+        .filter(F.col("Revenue_Rank") <= 5)
+        .select("Index_Group_Name")
+    )
 
     final_df = (
         transactions_df
-        .repartition(partition_count, "t_dat")
-        .withColumn("month_start", F.trunc("t_dat", "month"))
-        .groupBy("month_start")
-        .agg(F.sum("price").alias("monthly_revenue"))
-        .withColumn("previous_month_revenue", F.lag("monthly_revenue").over(month_window))
+        .repartition(partition_count, "article_id")
+        .filter(F.year("t_dat") == 2019)
+        .filter(F.col("price") > 0)
+        .join(articles_df.select("article_id", "index_group_name"), on="article_id", how="inner")
+        .withColumn("Index_Group_Name", F.initcap(F.coalesce(F.trim(F.col("index_group_name")), F.lit("Unknown"))))
+        .join(F.broadcast(top_groups_df), on="Index_Group_Name", how="inner")
+        .withColumn("Quarter_Label", F.concat(F.lit("2019-Q"), F.quarter("t_dat")))
+        .groupBy("Quarter_Label", "Index_Group_Name")
+        .agg(
+            F.count("*").alias("Transaction_Count"),
+            F.sum("price").alias("Quarter_Revenue"),
+        )
+        .withColumn("Previous_Quarter_Revenue", F.lag("Quarter_Revenue").over(quarter_window))
         .withColumn(
-            "growth_rate_pct",
+            "Growth_Rate_Pct",
             F.when(
-                (F.col("previous_month_revenue").isNotNull()) & (F.col("previous_month_revenue") != 0),
-                ((F.col("monthly_revenue") - F.col("previous_month_revenue")) / F.col("previous_month_revenue")) * 100.0,
+                F.col("Previous_Quarter_Revenue") > 0,
+                (F.col("Quarter_Revenue") - F.col("Previous_Quarter_Revenue")) / F.col("Previous_Quarter_Revenue") * 100.0,
             ),
         )
-        .orderBy("month_start")
+        .orderBy("Quarter_Label", F.desc("Quarter_Revenue"))
+        .limit(20)
     )
 
-    _execute_output_bundle(
-        df=final_df,
-        question_label="Question 4: Month-over-month revenue growth rate",
-        output_name="q4_monthly_growth_rate",
-        directories=directories,
-        plotter=_plot_q4_growth_rate,
+    final_df = round_existing(final_df, {"Quarter_Revenue": 2, "Previous_Quarter_Revenue": 2, "Growth_Rate_Pct": 2}).select(
+        F.col("Quarter_Label").alias("Квартал_2019_року"),
+        F.col("Index_Group_Name").alias("Глобальна_товарна_група"),
+        F.col("Transaction_Count").alias("Кількість_транзакцій"),
+        F.col("Quarter_Revenue").alias("Квартальна_виручка"),
+        F.col("Previous_Quarter_Revenue").alias("Виручка_попереднього_кварталу"),
+        F.col("Growth_Rate_Pct").alias("Темп_зростання_до_попереднього_кварталу_(відсоток)"),
+    )
+    save_report(
+        final_df,
+        "Question 4: Quarterly revenue growth by top index groups in 2019",
+        "q4_monthly_growth_rate",
+        directories,
     )
 
 
+# Питання: Якими є показники середнього чека, частоти покупок і витрат у 15 найчисленніших сегментах, сформованих за підпискою на модні новини, каналом та віком?
+# Опис колонок:
+# - Частота_отримання_модних_новин: Частота отримання модних новин клієнтом.
+# - Канал_продажу: Назва каналу продажу.
+# - Вікова_група: Віковий діапазон клієнтів.
+# - Кількість_клієнтів: Кількість унікальних клієнтів у сегменті.
+# - Кількість_транзакцій: Загальна кількість транзакцій у сегменті.
+# - Середня_ціна_товару: Середня ціна покупки у сегменті.
+# - Середня_кількість_транзакцій_на_клієнта: Середня кількість транзакцій на клієнта сегмента.
+# - Середні_витрати_на_клієнта: Середні витрати одного клієнта сегмента.
 def _question_5(
     transactions_df: DataFrame,
     customers_df: DataFrame,
     directories: Dict[str, str],
     partition_count: int,
 ) -> None:
-    final_df = (
+    customer_channel_df = (
         transactions_df
         .repartition(partition_count, "customer_id")
-        .alias("transactions")
-        .join(F.broadcast(customers_df).alias("customers"), on="customer_id", how="inner")
-        .filter(F.lower(F.trim(F.col("fashion_news_frequency"))) == F.lit("regularly"))
+        .filter(F.col("price") > 0)
+        .groupBy("customer_id", "sales_channel_id")
         .agg(
-            F.avg("price").alias("avg_check_value"),
-            F.count(F.lit(1)).alias("transaction_count"),
-            F.countDistinct("customer_id").alias("customer_count"),
+            F.count("*").alias("Transaction_Count"),
+            F.sum("price").alias("Total_Spend"),
+            F.avg("price").alias("Avg_Price"),
         )
-        .withColumn("segment_name", F.lit("Regular Fashion News Subscribers"))
+        .join(customers_df.select("customer_id", "fashion_news_frequency", "age"), on="customer_id", how="inner")
+        .withColumn("Channel_Name", build_channel_label_expression())
+        .withColumn("Age_Group", build_age_group_expression("age"))
+        .withColumn(
+            "Fashion_News_Frequency",
+            F.initcap(F.coalesce(F.trim(F.col("fashion_news_frequency")), F.lit("Unknown"))),
+        )
     )
 
-    _execute_output_bundle(
-        df=final_df,
-        question_label="Question 5: Average check for customers receiving fashion news regularly",
-        output_name="q5_regular_fashion_news_avg_check",
-        directories=directories,
-        plotter=_plot_q5_kpi_card,
+    final_df = (
+        customer_channel_df
+        .filter(F.col("Fashion_News_Frequency").isin("Regularly", "Monthly", "None"))
+        .groupBy("Fashion_News_Frequency", "Channel_Name", "Age_Group")
+        .agg(
+            F.countDistinct("customer_id").alias("Customer_Count"),
+            F.sum("Transaction_Count").alias("Transaction_Count"),
+            F.avg("Avg_Price").alias("Avg_Price"),
+            F.avg("Transaction_Count").alias("Avg_Transactions_Per_Customer"),
+            F.avg("Total_Spend").alias("Avg_Spend_Per_Customer"),
+        )
+        .orderBy(F.desc("Customer_Count"), "Fashion_News_Frequency", "Channel_Name", "Age_Group")
+        .limit(15)
+    )
+
+    final_df = round_existing(
+        final_df,
+        {
+            "Avg_Price": 4,
+            "Avg_Transactions_Per_Customer": 2,
+            "Avg_Spend_Per_Customer": 2,
+        },
+    ).select(
+        F.col("Fashion_News_Frequency").alias("Частота_отримання_модних_новин"),
+        F.col("Channel_Name").alias("Канал_продажу"),
+        F.col("Age_Group").alias("Вікова_група"),
+        F.col("Customer_Count").alias("Кількість_клієнтів"),
+        F.col("Transaction_Count").alias("Кількість_транзакцій"),
+        F.col("Avg_Price").alias("Середня_ціна_товару"),
+        F.col("Avg_Transactions_Per_Customer").alias("Середня_кількість_транзакцій_на_клієнта"),
+        F.col("Avg_Spend_Per_Customer").alias("Середні_витрати_на_клієнта"),
+    )
+    save_report(
+        final_df,
+        "Question 5: Customer spend profile by fashion news frequency, channel, and age group",
+        "q5_regular_fashion_news_avg_check",
+        directories,
     )
 
 
-def _question_6(transactions_df: DataFrame, directories: Dict[str, str], partition_count: int) -> None:
-    running_window = (
-        Window.partitionBy("sales_channel_id")
-        .orderBy("t_dat")
+# Питання: Якими є показники квартальної та накопиченої виручки у вибірці з 8 квартально-канальних сегментів 2019 року?
+# Опис колонок:
+# - Квартал_2019_року: Квартал 2019 року.
+# - Канал_продажу: Назва каналу продажу.
+# - Квартальна_виручка: Загальна виручка каналу у кварталі.
+# - Накопичена_виручка_каналу: Накопичена виручка каналу від початку року.
+# - Частка_від_виручки_кварталу_(відсоток): Частка виручки каналу серед усієї виручки кварталу.
+def _question_6(
+    transactions_df: DataFrame,
+    directories: Dict[str, str],
+    partition_count: int,
+) -> None:
+    cumulative_window = (
+        Window.partitionBy("Channel_Name")
+        .orderBy("Quarter_Label")
         .rowsBetween(Window.unboundedPreceding, Window.currentRow)
     )
+    quarter_share_window = Window.partitionBy("Quarter_Label")
 
     final_df = (
         transactions_df
         .repartition(partition_count, "t_dat")
-        .filter(F.year("t_dat") == F.lit(2019))
-        .groupBy("t_dat", "sales_channel_id")
-        .agg(F.sum("price").alias("daily_revenue"))
-        .withColumn("channel_name", _build_channel_label_expression())
-        .withColumn("running_total_revenue", F.sum("daily_revenue").over(running_window))
-        .select("t_dat", "sales_channel_id", "channel_name", "daily_revenue", "running_total_revenue")
-        .orderBy("t_dat", "sales_channel_id")
+        .filter(F.year("t_dat") == 2019)
+        .filter(F.col("price") > 0)
+        .withColumn("Quarter_Label", F.concat(F.lit("2019-Q"), F.quarter("t_dat")))
+        .withColumn("Channel_Name", build_channel_label_expression())
+        .groupBy("Quarter_Label", "Channel_Name")
+        .agg(F.sum("price").alias("Quarter_Revenue"))
+        .withColumn("Cumulative_Revenue", F.sum("Quarter_Revenue").over(cumulative_window))
+        .withColumn("Quarter_Total_Revenue", F.sum("Quarter_Revenue").over(quarter_share_window))
+        .withColumn(
+            "Quarter_Share_Pct",
+            F.when(
+                F.col("Quarter_Total_Revenue") > 0,
+                F.col("Quarter_Revenue") / F.col("Quarter_Total_Revenue") * 100.0,
+            ).otherwise(F.lit(0.0)),
+        )
+        .drop("Quarter_Total_Revenue")
+        .orderBy("Quarter_Label", "Channel_Name")
+        .limit(8)
     )
 
-    _execute_output_bundle(
-        df=final_df,
-        question_label="Question 6: Running total revenue in 2019 by sales channel",
-        output_name="q6_running_total_2019_by_channel",
-        directories=directories,
-        plotter=_plot_q6_running_total,
+    final_df = round_existing(final_df, {"Quarter_Revenue": 2, "Cumulative_Revenue": 2, "Quarter_Share_Pct": 2}).select(
+        F.col("Quarter_Label").alias("Квартал_2019_року"),
+        F.col("Channel_Name").alias("Канал_продажу"),
+        F.col("Quarter_Revenue").alias("Квартальна_виручка"),
+        F.col("Cumulative_Revenue").alias("Накопичена_виручка_каналу"),
+        F.col("Quarter_Share_Pct").alias("Частка_від_виручки_кварталу_(відсоток)"),
+    )
+    save_report(
+        final_df,
+        "Question 6: Quarterly and cumulative revenue by sales channel in 2019",
+        "q6_running_total_2019_by_channel",
+        directories,
     )
 
 
@@ -537,28 +411,24 @@ def run(
     processed_dir: str = "data/processed",
     output_dir: str = f"output/{MEMBER_NAME}",
 ) -> None:
-    directories = _ensure_output_dirs(output_dir)
-    explain_log_path = os.path.join(directories["logs"], "explain_logs.txt")
+    directories = ensure_output_dirs(output_dir)
+    initialize_explain_log(os.path.join(directories["logs"], "explain_logs.txt"), "Roman pipeline explain plans")
 
-    with open(explain_log_path, "w", encoding="utf-8") as log_file:
-        log_file.write("Roman pipeline explain plans\n")
-
-    transactions_df = _load_parquet_dataset(spark, processed_dir, "transactions")
-    articles_df = _load_parquet_dataset(spark, processed_dir, "articles")
-    customers_df = _load_parquet_dataset(spark, processed_dir, "customers")
-    partition_count = _recommended_partitions(spark)
+    transactions_df = load_parquet_dataset(spark, processed_dir, "transactions")
+    articles_df = load_parquet_dataset(spark, processed_dir, "articles")
+    customers_df = load_parquet_dataset(spark, processed_dir, "customers")
+    partition_count = recommended_partitions(spark)
 
     _question_1(transactions_df, articles_df, directories, partition_count)
     _question_2(transactions_df, directories, partition_count)
     _question_3(transactions_df, articles_df, directories, partition_count)
-    _question_4(transactions_df, directories, partition_count)
+    _question_4(transactions_df, articles_df, directories, partition_count)
     _question_5(transactions_df, customers_df, directories, partition_count)
     _question_6(transactions_df, directories, partition_count)
 
 
 if __name__ == "__main__":
     spark_session = create_spark_session("HM-Fashion-Roman-Pipeline")
-
     try:
         run(spark_session)
     finally:

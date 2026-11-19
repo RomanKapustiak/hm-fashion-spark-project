@@ -1,24 +1,11 @@
-"""Artem customer demographics and behavior transformation pipeline.
-
-Run inside Docker with:
-python src/transformations/artem_pipeline.py
-"""
+"""Artem customer demographics and behavior transformation pipeline."""
 
 from __future__ import annotations
 
-import contextlib
-import io
 import os
 import sys
 from typing import Dict
 
-import matplotlib
-
-matplotlib.use("Agg")
-
-import matplotlib.pyplot as plt
-import pandas as pd
-import seaborn as sns
 from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 
@@ -27,466 +14,449 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from src.spark_utils import create_spark_session
+from src.transformations.report_utils import (
+    build_age_group_expression,
+    build_channel_label_expression,
+    ensure_output_dirs,
+    initialize_explain_log,
+    load_parquet_dataset,
+    recommended_partitions,
+    round_existing,
+    save_report,
+)
 
 MEMBER_NAME = "artem"
-MAX_PANDAS_ROWS = 5000
-MIN_PARTITIONS = 8
-CHANNEL_LABELS = {
-    1: "Store",
-    2: "Online",
-}
-
-sns.set_theme(style="whitegrid", palette="muted")
 
 
-def _build_channel_label_expression() -> F.Column:
-    """Build a PySpark column expression for formatting sales channel IDs as human-readable labels."""
-    column = F.when(F.col("sales_channel_id") == F.lit(1), F.lit(CHANNEL_LABELS[1]))
-    column = column.when(F.col("sales_channel_id") == F.lit(2), F.lit(CHANNEL_LABELS[2]))
-    return column.otherwise(F.concat(F.lit("Channel "), F.col("sales_channel_id").cast("string")))
-
-
-def _ensure_output_dirs(output_dir: str) -> Dict[str, str]:
-    """Ensure the required output directories exist (csv, plots, logs) and return their specific paths."""
-    csv_dir = os.path.join(output_dir, "csv")
-    plots_dir = os.path.join(output_dir, "plots")
-    logs_dir = os.path.join(output_dir, "logs")
-
-    for directory in (output_dir, csv_dir, plots_dir, logs_dir):
-        os.makedirs(directory, exist_ok=True)
-
-    return {
-        "base": output_dir,
-        "csv": csv_dir,
-        "plots": plots_dir,
-        "logs": logs_dir,
-    }
-
-
-def _recommended_partitions(spark: SparkSession) -> int:
-    """Calculate the recommended minimum partitions based on your cluster properties and preset requirements."""
-    return max(spark.sparkContext.defaultParallelism, MIN_PARTITIONS)
-
-
-def _load_parquet_dataset(spark: SparkSession, processed_dir: str, dataset_name: str) -> DataFrame:
-    """Load a specific pre-processed Parquet dataset from the central processed outputs directory."""
-    path = os.path.join(processed_dir, dataset_name)
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Processed dataset not found: {path}")
-    return spark.read.parquet(path)
-
-
-def _write_explain_log(df: DataFrame, log_path: str, question_label: str) -> None:
-    """Execute the PySpark extended explain command on the dataframe and append it to the log file."""
-    buffer = io.StringIO()
-    with contextlib.redirect_stdout(buffer):
-        df.explain(extended=True)
-
-    with open(log_path, "a", encoding="utf-8") as log_file:
-        log_file.write(f"\n{'=' * 100}\n")
-        log_file.write(f"{question_label}\n")
-        log_file.write(f"{'=' * 100}\n")
-        log_file.write(buffer.getvalue().rstrip())
-        log_file.write("\n")
-
-
-def _save_csv(df: DataFrame, csv_dir: str, output_name: str) -> None:
-    """Coalesce the PySpark dataframe into a single file and securely overwrite as a local CSV format."""
-    output_path = os.path.join(csv_dir, output_name)
-    (
-        df.coalesce(1)
-        .write
-        .mode("overwrite")
-        .option("header", True)
-        .csv(output_path)
-    )
-
-
-def _to_small_pandas(df: DataFrame, output_name: str, max_rows: int = MAX_PANDAS_ROWS) -> pd.DataFrame:
-    """Convert an aggregated PySpark dataframe to a Pandas layout if it strictly obeys sizing limits."""
-    row_count = df.count()
-    if row_count > max_rows:
-        raise ValueError(
-            f"Refusing to convert '{output_name}' to pandas because it has {row_count} rows "
-            f"(limit: {max_rows})."
-        )
-    return df.toPandas()
-
-
-def _finalize_figure(fig: plt.Figure, path: str) -> None:
-    """Wrap up visualization aesthetics, strictly enforce high DPI margins, and save the PNG file locally."""
-    fig.tight_layout()
-    fig.savefig(path, dpi=300, bbox_inches="tight", facecolor="white")
-    plt.close(fig)
-
-
-def _save_no_data_plot(path: str, title: str, message: str = "No data available for this question.") -> None:
-    """Produce a generic clean placeholder image for scenarios where a pipeline yields heavily filtered empty sets."""
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.axis("off")
-    ax.text(0.5, 0.5, message, ha="center", va="center", fontsize=16, color="#4c566a")
-    ax.set_title(title, fontsize=16, weight="bold")
-    _finalize_figure(fig, path)
-
-
-def _execute_output_bundle(
-    df: DataFrame,
-    question_label: str,
-    output_name: str,
-    directories: Dict[str, str],
-    plotter,
-) -> None:
-    """Wrap standard end-of-pipeline methods handling logging, saving, pandas conversion, and plot triggers collectively."""
-    _write_explain_log(df, os.path.join(directories["logs"], "explain_logs.txt"), question_label)
-    _save_csv(df, directories["csv"], output_name)
-    pandas_df = _to_small_pandas(df, output_name)
-    plot_path = os.path.join(directories["plots"], f"{output_name}.png")
-    plotter(pandas_df, plot_path)
-
-
-def _plot_q1_age_distribution(pdf: pd.DataFrame, plot_path: str) -> None:
-    """Q1: Bar chart — number of customers per 5-year age group."""
-    title = "Age Distribution of Active Customers"
-    if pdf.empty:
-        _save_no_data_plot(plot_path, title)
-        return
-
-    fig, ax = plt.subplots(figsize=(14, 7))
-    sns.barplot(data=pdf, x="age_group", y="customer_count", color="#5B8E7D", ax=ax)
-    ax.set_title(title, fontsize=16, weight="bold")
-    ax.set_xlabel("Age Group")
-    ax.set_ylabel("Number of Customers")
-    ax.tick_params(axis="x", rotation=45)
-    ax.yaxis.set_major_formatter(plt.matplotlib.ticker.StrMethodFormatter('{x:,.0f}'))
-    
-    _finalize_figure(fig, plot_path)
-
-
-def _plot_q2_purchase_frequency(pdf: pd.DataFrame, plot_path: str) -> None:
-    """Q2: Bar chart — average purchases per customer for 'Regularly' vs 'NONE' news subscribers."""
-    title = "Average Purchase Count by Fashion News Subscription"
-    if pdf.empty:
-        _save_no_data_plot(plot_path, title)
-        return
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    sns.barplot(data=pdf, x="fashion_news_frequency", y="avg_purchases_per_customer", palette="muted", ax=ax)
-    
-    ax.set_title(title, fontsize=16, weight="bold")
-    ax.set_xlabel("Fashion News Status")
-    ax.set_ylabel("Average Purchases per Customer")
-    
-    for p in ax.patches:
-        ax.annotate(f"{p.get_height():.2f}", 
-                    (p.get_x() + p.get_width() / 2., p.get_height()), 
-                    ha='center', va='baseline', 
-                    fontsize=12, color='black', xytext=(0, 5), 
-                    textcoords='offset points')
-
-    _finalize_figure(fig, plot_path)
-
-
-def _plot_q3_top_postal_codes(pdf: pd.DataFrame, plot_path: str) -> None:
-    """Q3: Horizontal bar chart — top 15 postal codes ranked by active member count."""
-    title = "Top 15 Regions (Postal Codes) by Active Members"
-    if pdf.empty:
-        _save_no_data_plot(plot_path, title)
-        return
-        
-    fig, ax = plt.subplots(figsize=(12, 8))
-    sns.barplot(data=pdf, x="active_member_count", y="postal_code", palette="viridis_r", ax=ax)
-    
-    ax.set_title(title, fontsize=16, weight="bold")
-    ax.set_xscale("log")
-    ax.set_xlabel("Active Member Count (log scale)")
-    ax.set_ylabel("Postal Code")
-    ax.xaxis.set_major_formatter(plt.matplotlib.ticker.StrMethodFormatter('{x:,.0f}'))
-
-    _finalize_figure(fig, plot_path)
-
-
-def _plot_q4_spend_quartiles(pdf: pd.DataFrame, plot_path: str) -> None:
-    """Q4: Scatter + line chart — average customer age across 4 spending quartiles (Q1 = highest spenders)."""
-    title = "Average Customer Age by Spending Quartiles"
-    if pdf.empty:
-        _save_no_data_plot(plot_path, title)
-        return
-
-    pdf["spend_quartile_label"] = pdf["spend_quartile"].apply(lambda q: f"Q{q} (Rank {q})")
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    sns.scatterplot(data=pdf, x="spend_quartile_label", y="average_age", s=300, color="#E07A5F", ax=ax, zorder=5)
-    sns.lineplot(data=pdf, x="spend_quartile_label", y="average_age", color="#E07A5F", ax=ax, linewidth=2, linestyle="--", zorder=4)
-    
-    ax.set_title(title, fontsize=16, weight="bold")
-    ax.set_xlabel("Spending Quartile (Q1 = Highest Spenders)")
-    ax.set_ylabel("Average Age")
-    
-    _finalize_figure(fig, plot_path)
-
-
-def _plot_q5_top_youth_departments(pdf: pd.DataFrame, plot_path: str) -> None:
-    """Q5: Stacked bar chart — purchase counts for top 5 departments among under-25 customers, split by sales channel."""
-    title = "Top 5 Departments among Youth (<25 Years Old) by Channel"
-    if pdf.empty:
-        _save_no_data_plot(plot_path, title)
-        return
-
-    pivot_df = (
-        pdf.pivot_table(
-            index="department_name",
-            columns="channel_name",
-            values="purchase_count",
-            aggfunc="sum",
-            fill_value=0.0,
-        )
-    )
-    
-    pivot_df["Total"] = pivot_df.sum(axis=1)
-    pivot_df = pivot_df.sort_values("Total", ascending=False).drop("Total", axis=1)
-
-    fig, ax = plt.subplots(figsize=(14, 7))
-    colors = ["#4C78A8", "#F58518"]
-    pivot_df.plot(kind="bar", stacked=True, ax=ax, color=colors[:len(pivot_df.columns)], width=0.7)
-    
-    ax.set_title(title, fontsize=16, weight="bold")
-    ax.set_xlabel("Department Name")
-    ax.set_ylabel("Total Purchase Count")
-    ax.yaxis.set_major_formatter(plt.matplotlib.ticker.StrMethodFormatter('{x:,.0f}'))
-    ax.tick_params(axis="x", rotation=30)
-    ax.legend(title="Sales Channel")
-    
-    _finalize_figure(fig, plot_path)
-
-
-def _plot_q6_cumulative_new_customers(pdf: pd.DataFrame, plot_path: str) -> None:
-    """Q6: Area chart — cumulative total of first-time customers acquired per month over the full dataset period."""
-    title = "Cumulative Customer Acquisition Over Time"
-    if pdf.empty:
-        _save_no_data_plot(plot_path, title)
-        return
-
-    pdf["month_label"] = pd.to_datetime(pdf["month_start"]).dt.strftime("%Y-%m")
-
-    fig, ax = plt.subplots(figsize=(14, 7))
-    ax.fill_between(pdf["month_label"], pdf["cumulative_new_customers"], color="#6C8EBF", alpha=0.5)
-    ax.plot(pdf["month_label"], pdf["cumulative_new_customers"], color="#4C78A8", linewidth=2.5)
-
-    ax.set_title(title, fontsize=16, weight="bold")
-    ax.set_xlabel("Month")
-    ax.set_ylabel("Cumulative Total Customers")
-    ax.yaxis.set_major_formatter(plt.matplotlib.ticker.StrMethodFormatter('{x:,.0f}'))
-    ax.tick_params(axis="x", rotation=45)
-    
-    _finalize_figure(fig, plot_path)
-
-
-def _question_1(customers_df: DataFrame, directories: Dict[str, str], partition_count: int) -> None:
-    """Q1: What is the age distribution of active customers in 5-year buckets? 
-    Operations: filter, group by. Plot: bar chart."""
-    final_df = (
-        customers_df
-        .repartition(partition_count, "customer_id")
-        .filter(F.col("age").isNotNull() & (F.lower(F.col("club_member_status")) == F.lit("active")))
-        .withColumn("age_bucket", (F.floor(F.col("age") / 5) * 5).cast("int"))
-        .withColumn(
-            "age_group", 
-            F.concat(F.col("age_bucket").cast("string"), F.lit("-"), (F.col("age_bucket") + 4).cast("string"))
-        )
-        .groupBy("age_group")
-        .agg(F.count(F.lit(1)).alias("customer_count"))
-        .orderBy("age_group")
-    )
-
-    _execute_output_bundle(
-        df=final_df,
-        question_label="Question 1: Active customer age distribution (5-year groups)",
-        output_name="q1_age_distribution",
-        directories=directories,
-        plotter=_plot_q1_age_distribution,
-    )
-
-
-def _question_2(
-    transactions_df: DataFrame, 
-    customers_df: DataFrame, 
-    directories: Dict[str, str], 
-    partition_count: int
-) -> None:
-    """Q2: How does avg purchase count differ between 'Regularly' and 'NONE' news subscribers? 
-    Operations: filter, join, group by. Plot: bar chart."""
-    filtered_customers = (
-        customers_df
-        .withColumn("fashion_news_frequency", F.upper(F.trim(F.col("fashion_news_frequency"))))
-        .filter(F.col("fashion_news_frequency").isin("REGULARLY", "NONE"))
-    )
-
-    final_df = (
+def _customer_transaction_profile(
+    transactions_df: DataFrame,
+    customers_df: DataFrame,
+    partition_count: int,
+) -> DataFrame:
+    return (
         transactions_df
         .repartition(partition_count, "customer_id")
-        .join(F.broadcast(filtered_customers), on="customer_id", how="inner")
-        .groupBy("customer_id", "fashion_news_frequency")
-        .agg(F.count(F.lit(1)).alias("purchase_count"))
-        .groupBy("fashion_news_frequency")
-        .agg(F.avg("purchase_count").alias("avg_purchases_per_customer"))
+        .groupBy("customer_id", "sales_channel_id")
+        .agg(
+            F.count("*").alias("Transaction_Count"),
+            F.sum("price").alias("Total_Spend"),
+            F.avg("price").alias("Avg_Price"),
+        )
+        .join(
+            customers_df.select(
+                "customer_id",
+                "age",
+                "club_member_status",
+                "fashion_news_frequency",
+            ),
+            on="customer_id",
+            how="inner",
+        )
+        .withColumn("Age_Group", build_age_group_expression("age"))
+        .withColumn(
+            "Club_Member_Status",
+            F.initcap(F.coalesce(F.trim(F.col("club_member_status")), F.lit("Unknown"))),
+        )
+        .withColumn(
+            "Fashion_News_Frequency",
+            F.initcap(F.coalesce(F.trim(F.col("fashion_news_frequency")), F.lit("Unknown"))),
+        )
+        .withColumn("Channel_Name", build_channel_label_expression())
     )
 
-    _execute_output_bundle(
-        df=final_df,
-        question_label="Question 2: Average purchase frequency by fashion news status",
-        output_name="q2_purchase_frequency_by_news",
-        directories=directories,
-        plotter=_plot_q2_purchase_frequency,
-    )
 
-
-def _question_3(customers_df: DataFrame, directories: Dict[str, str], partition_count: int) -> None:
-    """Q3: Which 15 postal codes have the most active club members? 
-    Operations: filter, group by, window (row_number). Plot: horizontal bar chart."""
-    rank_window = Window.orderBy(F.desc("active_member_count"))
+# Питання: Якими є показники клієнтської активності та витрат у 10 найчисленніших сегментах, сформованих за віковою групою та статусом клубного членства?
+# Опис колонок:
+# - Вікова_група: Віковий діапазон клієнтів.
+# - Статус_клубного_членства: Текстовий статус клубного членства клієнта.
+# - Кількість_клієнтів: Кількість унікальних клієнтів у сегменті.
+# - Кількість_транзакцій: Загальна кількість транзакцій у сегменті.
+# - Середня_кількість_транзакцій_на_клієнта: Середня кількість транзакцій на одного клієнта сегмента.
+# - Середні_витрати_на_клієнта: Середня сума витрат одного клієнта сегмента.
+# - Середня_ціна_товару: Середня ціна однієї покупки в сегменті.
+def _question_1(
+    transactions_df: DataFrame,
+    customers_df: DataFrame,
+    directories: Dict[str, str],
+    partition_count: int,
+) -> None:
+    profile_df = _customer_transaction_profile(transactions_df, customers_df, partition_count)
 
     final_df = (
-        customers_df
-        .repartition(partition_count, "postal_code")
-        .filter(F.lower(F.col("club_member_status")) == F.lit("active"))
-        .groupBy("postal_code")
-        .agg(F.count(F.lit(1)).alias("active_member_count"))
-        .withColumn("postal_rank", F.row_number().over(rank_window))
-        .filter(F.col("postal_rank") <= 15)
-        .orderBy("postal_rank")
+        profile_df
+        .filter(F.col("age").isNotNull())
+        .filter(F.col("Transaction_Count") > 0)
+        .groupBy("Age_Group", "Club_Member_Status")
+        .agg(
+            F.countDistinct("customer_id").alias("Customer_Count"),
+            F.sum("Transaction_Count").alias("Transaction_Count"),
+            F.avg("Transaction_Count").alias("Avg_Transactions_Per_Customer"),
+            F.avg("Total_Spend").alias("Avg_Spend_Per_Customer"),
+            F.avg("Avg_Price").alias("Avg_Price"),
+        )
+        .orderBy(F.desc("Customer_Count"), "Age_Group", "Club_Member_Status")
+        .limit(10)
     )
 
-    _execute_output_bundle(
-        df=final_df,
-        question_label="Question 3: Top 15 postal codes by active members",
-        output_name="q3_top15_postal_codes",
-        directories=directories,
-        plotter=_plot_q3_top_postal_codes,
+    final_df = round_existing(
+        final_df,
+        {
+            "Avg_Transactions_Per_Customer": 2,
+            "Avg_Spend_Per_Customer": 2,
+            "Avg_Price": 4,
+        },
+    ).select(
+        F.col("Age_Group").alias("Вікова_група"),
+        F.col("Club_Member_Status").alias("Статус_клубного_членства"),
+        F.col("Customer_Count").alias("Кількість_клієнтів"),
+        F.col("Transaction_Count").alias("Кількість_транзакцій"),
+        F.col("Avg_Transactions_Per_Customer").alias("Середня_кількість_транзакцій_на_клієнта"),
+        F.col("Avg_Spend_Per_Customer").alias("Середні_витрати_на_клієнта"),
+        F.col("Avg_Price").alias("Середня_ціна_товару"),
+    )
+
+    save_report(
+        final_df,
+        "Question 1: Customer and transaction profile by age group and club member status",
+        "q1_age_distribution",
+        directories,
     )
 
 
-def _question_4(
-    transactions_df: DataFrame, 
-    customers_df: DataFrame, 
-    directories: Dict[str, str], 
-    partition_count: int
+# Питання: Якими є показники частоти покупок і середніх витрат у 12 найчисленніших сегментах клієнтів, сформованих за частотою отримання модних новин і віковими групами?
+# Опис колонок:
+# - Частота_отримання_модних_новин: Частота отримання модних новин клієнтом.
+# - Вікова_група: Віковий діапазон клієнтів.
+# - Кількість_клієнтів: Кількість унікальних клієнтів у сегменті.
+# - Середня_кількість_транзакцій_на_клієнта: Середня кількість транзакцій на одного клієнта сегмента.
+# - Середні_витрати_на_клієнта: Середня сума витрат одного клієнта сегмента.
+# - Середня_ціна_товару: Середня ціна покупки в сегменті.
+def _question_2(
+    transactions_df: DataFrame,
+    customers_df: DataFrame,
+    directories: Dict[str, str],
+    partition_count: int,
 ) -> None:
-    """Q4: What is the average age of customers in each of the 4 spending quartiles? 
-    Operations: join, group by, window (ntile). Plot: scatter + line chart."""
-    spend_window = Window.orderBy(F.desc("total_spent"))
+    profile_df = _customer_transaction_profile(transactions_df, customers_df, partition_count)
 
-    customer_spends = (
+    final_df = (
+        profile_df
+        .filter(F.col("age").isNotNull())
+        .filter(F.col("Fashion_News_Frequency").isin("Regularly", "Monthly", "None"))
+        .groupBy("Fashion_News_Frequency", "Age_Group")
+        .agg(
+            F.countDistinct("customer_id").alias("Customer_Count"),
+            F.avg("Transaction_Count").alias("Avg_Transactions_Per_Customer"),
+            F.avg("Total_Spend").alias("Avg_Spend_Per_Customer"),
+            F.avg("Avg_Price").alias("Avg_Price"),
+        )
+        .orderBy(F.desc("Customer_Count"), "Fashion_News_Frequency", "Age_Group")
+        .limit(12)
+    )
+
+    final_df = round_existing(
+        final_df,
+        {
+            "Avg_Transactions_Per_Customer": 2,
+            "Avg_Spend_Per_Customer": 2,
+            "Avg_Price": 4,
+        },
+    ).select(
+        F.col("Fashion_News_Frequency").alias("Частота_отримання_модних_новин"),
+        F.col("Age_Group").alias("Вікова_група"),
+        F.col("Customer_Count").alias("Кількість_клієнтів"),
+        F.col("Avg_Transactions_Per_Customer").alias("Середня_кількість_транзакцій_на_клієнта"),
+        F.col("Avg_Spend_Per_Customer").alias("Середні_витрати_на_клієнта"),
+        F.col("Avg_Price").alias("Середня_ціна_товару"),
+    )
+
+    save_report(
+        final_df,
+        "Question 2: Purchase frequency and spend by fashion news frequency and age group",
+        "q2_purchase_frequency_by_news",
+        directories,
+    )
+
+
+# Питання: Які 8 ключових сегментів за каналами продажу та статусами клубного членства мають найвищі показники клієнтської активності?
+# Опис колонок:
+# - Канал_продажу: Назва каналу продажу.
+# - Статус_клубного_членства: Текстовий статус клубного членства клієнта.
+# - Кількість_клієнтів: Кількість унікальних клієнтів у сегменті.
+# - Середня_кількість_транзакцій_на_клієнта: Середня кількість транзакцій на одного клієнта сегмента.
+# - Середні_витрати_на_клієнта: Середня сума витрат одного клієнта сегмента.
+# - Частка_від_клієнтів_даного_статусу_(відсоток): Частка клієнтів цього каналу серед усіх клієнтів даного статусу.
+def _question_3(
+    transactions_df: DataFrame,
+    customers_df: DataFrame,
+    directories: Dict[str, str],
+    partition_count: int,
+) -> None:
+    profile_df = _customer_transaction_profile(transactions_df, customers_df, partition_count)
+    segment_window = Window.partitionBy("Club_Member_Status")
+
+    final_df = (
+        profile_df
+        .filter(F.col("Club_Member_Status") != "Unknown")
+        .filter(F.col("Transaction_Count") > 0)
+        .groupBy("Channel_Name", "Club_Member_Status")
+        .agg(
+            F.countDistinct("customer_id").alias("Customer_Count"),
+            F.avg("Transaction_Count").alias("Avg_Transactions_Per_Customer"),
+            F.avg("Total_Spend").alias("Avg_Spend_Per_Customer"),
+        )
+        .withColumn("Status_Customer_Total", F.sum("Customer_Count").over(segment_window))
+        .withColumn(
+            "Customer_Share_Pct",
+            F.when(
+                F.col("Status_Customer_Total") > 0,
+                F.col("Customer_Count") / F.col("Status_Customer_Total") * F.lit(100.0),
+            ).otherwise(F.lit(0.0)),
+        )
+        .drop("Status_Customer_Total")
+        .orderBy(F.desc("Customer_Count"), "Club_Member_Status", "Channel_Name")
+        .limit(8)
+    )
+
+    final_df = round_existing(
+        final_df,
+        {
+            "Avg_Transactions_Per_Customer": 2,
+            "Avg_Spend_Per_Customer": 2,
+            "Customer_Share_Pct": 2,
+        },
+    ).select(
+        F.col("Channel_Name").alias("Канал_продажу"),
+        F.col("Club_Member_Status").alias("Статус_клубного_членства"),
+        F.col("Customer_Count").alias("Кількість_клієнтів"),
+        F.col("Avg_Transactions_Per_Customer").alias("Середня_кількість_транзакцій_на_клієнта"),
+        F.col("Avg_Spend_Per_Customer").alias("Середні_витрати_на_клієнта"),
+        F.col("Customer_Share_Pct").alias("Частка_від_клієнтів_даного_статусу_(відсоток)"),
+    )
+
+    save_report(
+        final_df,
+        "Question 3: Customer activity by sales channel and club member status",
+        "q3_top15_postal_codes",
+        directories,
+    )
+
+
+# Питання: Якими є характеристики 12 найчисленніших сегментів клієнтів, сформованих за квартилями витрат і віковими групами?
+# Опис колонок:
+# - Квартиль_витрат: Квартиль клієнтів за загальними витратами.
+# - Вікова_група: Віковий діапазон клієнтів.
+# - Кількість_клієнтів: Кількість унікальних клієнтів у сегменті.
+# - Середній_вік: Середній вік клієнтів сегмента.
+# - Середні_загальні_витрати_на_клієнта: Середня сума витрат одного клієнта сегмента.
+# - Середня_кількість_транзакцій_на_клієнта: Середня кількість транзакцій на одного клієнта сегмента.
+def _question_4(
+    transactions_df: DataFrame,
+    customers_df: DataFrame,
+    directories: Dict[str, str],
+    partition_count: int,
+) -> None:
+    spend_window = Window.orderBy(F.desc("Total_Spend"))
+
+    customer_totals_df = (
         transactions_df
         .repartition(partition_count, "customer_id")
         .groupBy("customer_id")
-        .agg(F.sum("price").alias("total_spent"))
-    )
-    
-    final_df = (
-        customer_spends
-        .join(F.broadcast(customers_df.filter(F.col("age").isNotNull())), on="customer_id", how="inner")
-        .withColumn("spend_quartile", F.ntile(4).over(spend_window))
-        .groupBy("spend_quartile")
         .agg(
-            F.avg("age").alias("average_age"), 
-            F.count(F.lit(1)).alias("customer_count")
+            F.count("*").alias("Transaction_Count"),
+            F.sum("price").alias("Total_Spend"),
         )
-        .orderBy("spend_quartile")
-    )
-
-    _execute_output_bundle(
-        df=final_df,
-        question_label="Question 4: Quartiles by overall spend and average age",
-        output_name="q4_spending_quartiles_age",
-        directories=directories,
-        plotter=_plot_q4_spend_quartiles,
-    )
-
-
-def _question_5(
-    transactions_df: DataFrame, 
-    customers_df: DataFrame, 
-    articles_df: DataFrame, 
-    directories: Dict[str, str], 
-    partition_count: int
-) -> None:
-    """Q5: Which 5 departments are most popular among customers under 25? 
-    Operations: filter, join x3, group by. Plot: stacked bar chart by channel."""
-    youth_customers = (
-        customers_df
-        .filter(F.col("age") < 25)
-        .select("customer_id")
-    )
-
-    youth_transactions = (
-        transactions_df
-        .repartition(partition_count, "customer_id")
-        .join(F.broadcast(youth_customers), on="customer_id", how="inner")
-        .join(F.broadcast(articles_df), on="article_id", how="inner")
-        .withColumn("department_name", F.coalesce(F.col("department_name"), F.lit("Unknown")))
-        .withColumn("channel_name", _build_channel_label_expression())
-    )
-
-    top_departments = (
-        youth_transactions
-        .groupBy("department_name")
-        .agg(F.count(F.lit(1)).alias("total_purchases"))
-        .orderBy(F.desc("total_purchases"))
-        .limit(5)
-        .select("department_name")
+        .join(customers_df.select("customer_id", "age"), on="customer_id", how="inner")
+        .filter(F.col("age").isNotNull())
+        .withColumn("Age_Group", build_age_group_expression("age"))
+        .withColumn("Spend_Quartile", F.ntile(4).over(spend_window))
     )
 
     final_df = (
-        youth_transactions
-        .join(F.broadcast(top_departments), on="department_name", how="inner")
-        .groupBy("department_name", "channel_name")
-        .agg(F.count(F.lit(1)).alias("purchase_count"))
-        .orderBy("department_name", "channel_name")
+        customer_totals_df
+        .groupBy("Spend_Quartile", "Age_Group")
+        .agg(
+            F.countDistinct("customer_id").alias("Customer_Count"),
+            F.avg("age").alias("Avg_Age"),
+            F.avg("Total_Spend").alias("Avg_Total_Spend"),
+            F.avg("Transaction_Count").alias("Avg_Transactions_Per_Customer"),
+        )
+        .orderBy(F.desc("Customer_Count"), "Spend_Quartile", "Age_Group")
+        .limit(12)
     )
 
-    _execute_output_bundle(
-        df=final_df,
-        question_label="Question 5: Top 5 departments for customers under 25",
-        output_name="q5_top_departments_youth",
-        directories=directories,
-        plotter=_plot_q5_top_youth_departments,
+    final_df = round_existing(
+        final_df,
+        {
+            "Avg_Age": 2,
+            "Avg_Total_Spend": 2,
+            "Avg_Transactions_Per_Customer": 2,
+        },
+    ).select(
+        F.col("Spend_Quartile").alias("Квартиль_витрат"),
+        F.col("Age_Group").alias("Вікова_група"),
+        F.col("Customer_Count").alias("Кількість_клієнтів"),
+        F.col("Avg_Age").alias("Середній_вік"),
+        F.col("Avg_Total_Spend").alias("Середні_загальні_витрати_на_клієнта"),
+        F.col("Avg_Transactions_Per_Customer").alias("Середня_кількість_транзакцій_на_клієнта"),
+    )
+
+    save_report(
+        final_df,
+        "Question 4: Customer profile by spending quartile and age group",
+        "q4_spending_quartiles_age",
+        directories,
     )
 
 
-def _question_6(transactions_df: DataFrame, directories: Dict[str, str], partition_count: int) -> None:
-    """Q6: How many new customers were acquired each month (cumulative)? 
-    Operations: window (min, unbounded sum). Plot: area chart."""
-    first_purchase_window = Window.partitionBy("customer_id")
-    
-    first_purchases = (
+# Питання: Які 10 пріоритетних молодіжних відділів забезпечують найвищі показники виручки та найбільшу частку продажів у розрізі каналів?
+# Опис колонок:
+# - Назва_відділу: Текстова назва товарного відділу.
+# - Канал_продажу: Назва каналу продажу.
+# - Кількість_транзакцій: Загальна кількість транзакцій сегмента.
+# - Загальна_виручка: Загальна виручка сегмента.
+# - Середня_ціна_товару: Середня ціна покупки сегмента.
+# - Частка_від_виручки_каналу_(відсоток): Частка виручки відділу серед усієї виручки цього каналу.
+def _question_5(
+    transactions_df: DataFrame,
+    customers_df: DataFrame,
+    articles_df: DataFrame,
+    directories: Dict[str, str],
+    partition_count: int,
+) -> None:
+    youth_customers_df = customers_df.filter((F.col("age") >= 16) & (F.col("age") <= 24)).select("customer_id")
+
+    youth_transactions_df = (
         transactions_df
         .repartition(partition_count, "customer_id")
-        .withColumn("first_transaction_date", F.min("t_dat").over(first_purchase_window))
-        .filter(F.col("t_dat") == F.col("first_transaction_date"))
-        .select("customer_id", "first_transaction_date")
-        .dropDuplicates(["customer_id"])
+        .join(F.broadcast(youth_customers_df), on="customer_id", how="inner")
+        .join(
+            F.broadcast(
+                articles_df.select("article_id", "department_name").withColumn(
+                    "Department_Name",
+                    F.initcap(F.coalesce(F.trim(F.col("department_name")), F.lit("Unknown"))),
+                )
+            ),
+            on="article_id",
+            how="inner",
+        )
+        .withColumn("Channel_Name", build_channel_label_expression())
     )
 
+    revenue_window = Window.partitionBy("Channel_Name")
+
+    final_df = (
+        youth_transactions_df
+        .groupBy("Department_Name", "Channel_Name")
+        .agg(
+            F.count("*").alias("Transaction_Count"),
+            F.sum("price").alias("Total_Revenue"),
+            F.avg("price").alias("Avg_Price"),
+        )
+        .filter(F.col("Transaction_Count") >= 100)
+        .withColumn("Channel_Revenue_Total", F.sum("Total_Revenue").over(revenue_window))
+        .withColumn(
+            "Revenue_Share_Pct",
+            F.when(
+                F.col("Channel_Revenue_Total") > 0,
+                F.col("Total_Revenue") / F.col("Channel_Revenue_Total") * F.lit(100.0),
+            ).otherwise(F.lit(0.0)),
+        )
+        .drop("Channel_Revenue_Total")
+        .orderBy(F.desc("Total_Revenue"), "Department_Name", "Channel_Name")
+        .limit(10)
+    )
+
+    final_df = round_existing(
+        final_df,
+        {
+            "Total_Revenue": 2,
+            "Avg_Price": 4,
+            "Revenue_Share_Pct": 2,
+        },
+    ).select(
+        F.col("Department_Name").alias("Назва_відділу"),
+        F.col("Channel_Name").alias("Канал_продажу"),
+        F.col("Transaction_Count").alias("Кількість_транзакцій"),
+        F.col("Total_Revenue").alias("Загальна_виручка"),
+        F.col("Avg_Price").alias("Середня_ціна_товару"),
+        F.col("Revenue_Share_Pct").alias("Частка_від_виручки_каналу_(відсоток)"),
+    )
+
+    save_report(
+        final_df,
+        "Question 5: Revenue and sales share of youth departments by channel",
+        "q5_top_departments_youth",
+        directories,
+    )
+
+
+# Питання: Якими є показники залучення нових клієнтів і накопичення клієнтської бази у вибірці з 12 квартально-статусних сегментів 2019 року?
+# Опис колонок:
+# - Квартал_2019_року: Квартал 2019 року, у якому клієнт здійснив першу покупку.
+# - Статус_клубного_членства: Текстовий статус клубного членства клієнта.
+# - Кількість_нових_клієнтів: Кількість нових клієнтів у кварталі.
+# - Накопичена_кількість_нових_клієнтів: Накопичена кількість нових клієнтів у межах статусу.
+# - Частка_від_нових_клієнтів_кварталу_(відсоток): Частка нових клієнтів цього статусу серед усіх нових клієнтів кварталу.
+def _question_6(
+    transactions_df: DataFrame,
+    customers_df: DataFrame,
+    directories: Dict[str, str],
+    partition_count: int,
+) -> None:
+    first_purchase_window = Window.partitionBy("customer_id").orderBy("t_dat", "sales_channel_id")
     cumulative_window = (
-        Window.orderBy("month_start")
+        Window.partitionBy("Club_Member_Status")
+        .orderBy("Quarter_Label")
         .rowsBetween(Window.unboundedPreceding, Window.currentRow)
     )
+    quarter_window = Window.partitionBy("Quarter_Label")
 
-    final_df = (
-        first_purchases
-        .withColumn("month_start", F.trunc("first_transaction_date", "month"))
-        .groupBy("month_start")
-        .agg(F.count(F.lit(1)).alias("new_customers"))
-        .withColumn("cumulative_new_customers", F.sum("new_customers").over(cumulative_window))
-        .orderBy("month_start")
+    first_purchase_df = (
+        transactions_df
+        .repartition(partition_count, "customer_id")
+        .filter(F.year("t_dat") == 2019)
+        .withColumn("Purchase_Rank", F.row_number().over(first_purchase_window))
+        .filter(F.col("Purchase_Rank") == 1)
+        .join(customers_df.select("customer_id", "club_member_status"), on="customer_id", how="left")
+        .withColumn("Quarter_Label", F.concat(F.lit("2019-Q"), F.quarter("t_dat")))
+        .withColumn(
+            "Club_Member_Status",
+            F.initcap(F.coalesce(F.trim(F.col("club_member_status")), F.lit("Unknown"))),
+        )
     )
 
-    _execute_output_bundle(
-        df=final_df,
-        question_label="Question 6: Cumulative new customer acquisition over time",
-        output_name="q6_cumulative_new_customers",
-        directories=directories,
-        plotter=_plot_q6_cumulative_new_customers,
+    final_df = (
+        first_purchase_df
+        .groupBy("Quarter_Label", "Club_Member_Status")
+        .agg(F.countDistinct("customer_id").alias("New_Customers"))
+        .withColumn("Cumulative_New_Customers", F.sum("New_Customers").over(cumulative_window))
+        .withColumn("Quarter_Total_Customers", F.sum("New_Customers").over(quarter_window))
+        .withColumn(
+            "Quarterly_Share_Pct",
+            F.when(
+                F.col("Quarter_Total_Customers") > 0,
+                F.col("New_Customers") / F.col("Quarter_Total_Customers") * F.lit(100.0),
+            ).otherwise(F.lit(0.0)),
+        )
+        .drop("Quarter_Total_Customers")
+        .orderBy("Quarter_Label", "Club_Member_Status")
+        .limit(12)
+    )
+
+    final_df = round_existing(final_df, {"Quarterly_Share_Pct": 2}).select(
+        F.col("Quarter_Label").alias("Квартал_2019_року"),
+        F.col("Club_Member_Status").alias("Статус_клубного_членства"),
+        F.col("New_Customers").alias("Кількість_нових_клієнтів"),
+        F.col("Cumulative_New_Customers").alias("Накопичена_кількість_нових_клієнтів"),
+        F.col("Quarterly_Share_Pct").alias("Частка_від_нових_клієнтів_кварталу_(відсоток)"),
+    )
+
+    save_report(
+        final_df,
+        "Question 6: Quarterly new customers and cumulative customer base by club member status for 2019",
+        "q6_cumulative_new_customers",
+        directories,
     )
 
 
@@ -495,31 +465,25 @@ def run(
     processed_dir: str = "data/processed",
     output_dir: str = f"output/{MEMBER_NAME}",
 ) -> None:
-    """Execute the sequential extraction and parsing of entire transformation workloads assigned individually."""
-    directories = _ensure_output_dirs(output_dir)
-    explain_log_path = os.path.join(directories["logs"], "explain_logs.txt")
+    directories = ensure_output_dirs(output_dir)
+    initialize_explain_log(os.path.join(directories["logs"], "explain_logs.txt"), "Artem pipeline explain plans")
 
-    with open(explain_log_path, "w", encoding="utf-8") as log_file:
-        log_file.write("Artem pipeline explain plans\n")
+    transactions_df = load_parquet_dataset(spark, processed_dir, "transactions")
+    articles_df = load_parquet_dataset(spark, processed_dir, "articles")
+    customers_df = load_parquet_dataset(spark, processed_dir, "customers")
+    partition_count = recommended_partitions(spark)
 
-    transactions_df = _load_parquet_dataset(spark, processed_dir, "transactions")
-    articles_df = _load_parquet_dataset(spark, processed_dir, "articles")
-    customers_df = _load_parquet_dataset(spark, processed_dir, "customers")
-    partition_count = _recommended_partitions(spark)
-
-    _question_1(customers_df, directories, partition_count)
+    _question_1(transactions_df, customers_df, directories, partition_count)
     _question_2(transactions_df, customers_df, directories, partition_count)
-    _question_3(customers_df, directories, partition_count)
+    _question_3(transactions_df, customers_df, directories, partition_count)
     _question_4(transactions_df, customers_df, directories, partition_count)
     _question_5(transactions_df, customers_df, articles_df, directories, partition_count)
-    _question_6(transactions_df, directories, partition_count)
+    _question_6(transactions_df, customers_df, directories, partition_count)
 
 
 if __name__ == "__main__":
     spark_session = create_spark_session("HM-Fashion-Artem-Pipeline")
-
     try:
         run(spark_session)
     finally:
         spark_session.stop()
-
