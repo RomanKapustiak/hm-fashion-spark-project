@@ -65,7 +65,6 @@ docker compose run --rm spark-app python src/transformations/roman_pipeline.py
 It reads the processed parquet data and writes outputs to:
 ```text
 output/roman/csv/
-output/roman/plots/
 output/roman/logs/
 ```
 
@@ -82,11 +81,10 @@ docker compose run --rm spark-app python src/transformations/yura_pipeline.py
 It reads the processed parquet data and writes outputs to:
 ```text
 output/yura/csv/
-output/yura/plots/
 output/yura/logs/
 ```
 
-The `output/` directory is mounted into the container, so generated CSV files, plots, and explain logs are persisted on your local machine.
+The `output/` directory is mounted into the container, so generated CSV files and explain logs are persisted on your local machine.
 
 ### 6. Data Analysis Stage (Regression & Classification Models)
 Two shared tasks, all models use the same feature tables and the same train/test split:
@@ -150,7 +148,7 @@ Use `notebook` service to start Jupyter Lab in your browser.
 docker compose up notebook
 ```
 
-Then open **http://localhost:8888** in your browser. The `notebooks/` folder is mounted, so any notebooks you create or edit are saved to your local disk.
+Then open **http://localhost:8888** in your browser. Jupyter starts in `src/` (project notebooks are in `src/notebooks/`); `src/` is mounted, so any notebooks you create or edit are saved to your local disk.
 
 In notebooks, use absolute container paths for data:
 ```python

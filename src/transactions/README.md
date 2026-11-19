@@ -85,7 +85,7 @@ docker compose run --rm spark-app python -m pytest tests/transactions/ -v
 
 # interactive notebook
 docker compose up notebook
-# → http://localhost:8888 → src/notebooks/roman_transactions.ipynb
+# → http://localhost:8888 → src/notebooks/transactions.ipynb
 ```
 
 ## Output
