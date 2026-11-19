@@ -63,24 +63,25 @@ Two shared tasks on shared feature tables with a shared train/test split (`src/a
 - Regression: average price of an article from its characteristics.
 
 Each member owns one algorithm family and applies it to both tasks:
-- Roman: Linear models — `LinearRegression`, `LogisticRegression`. Shared foundation: feature tables, split, preprocessing, tuning and evaluation utilities, fix of customer null handling, model comparison.
-- Taras: Decision tree — `DecisionTreeRegressor`, `DecisionTreeClassifier`.
-- Artem: Random forest — `RandomForestRegressor`, `RandomForestClassifier`. Review of customer features.
-- Dmytro: Gradient-boosted trees — `GBTRegressor`, `GBTClassifier`.
-- Yura: Factorization machines — `FMRegressor`, `FMClassifier`.
+- Roman: Linear models — `LinearRegression`, `LogisticRegression`. Shared foundation: feature tables, split, preprocessing, tuning and evaluation utilities, fix of customer null handling.
+- Taras: Decision tree — `DecisionTreeRegressor`, `DecisionTreeClassifier`. Comparison of all models and conclusions.
+- Artem: Random forest — `RandomForestRegressor`, `RandomForestClassifier`. Presentation of the stage.
+- Dmytro: Gradient-boosted trees — `GBTRegressor`, `GBTClassifier`. Report section for the stage.
+- Yura: Factorization machines — `FMRegressor`, `FMClassifier`. Re-run of business queries affected by the customer data fix.
 
 Requirements per member: hyper-parameter tuning, analysis of the training process, test metrics (RMSE, R² / Accuracy, Precision, Recall, F1), comparison against a trivial baseline.
 
 ### 7) Results Writing Stage
-- Taras: Export product analytics to CSV
+- Taras: Export product analytics to CSV; model comparison tables (`output/ml/comparison/`)
 - Yura: Export design/trend analytics to CSV
 - Artem: Export customer segmentation to CSV
-- Roman: Export financial reports and sales-channel analytics to CSV; model comparison tables (`output/ml/comparison/`)
+- Roman: Export financial reports and sales-channel analytics to CSV
 - Dmytro: Validate pipeline outputs and ensure CSV storage in Docker
 - All members: model metrics, tuning results and training plots to `output/ml/<member>/`
 
 ### 8) Presentation Stage
 - Team presentation of findings and pipeline demonstration (shared responsibility).
+- Data analysis stage slides: Artem (each member provides material about their model).
 
 ---
 
