@@ -87,6 +87,27 @@ output/yura/logs/
 ```
 
 The `output/` directory is mounted into the container, so generated CSV files, plots, and explain logs are persisted on your local machine.
+
+### 6. Data Analysis Stage (Regression & Classification Models)
+Two shared tasks, all models use the same feature tables and the same train/test split:
+* **Classification** — will a customer buy anything during the next 4 weeks (`data/ml/customers_features`).
+* **Regression** — average price of an article from its characteristics (`data/ml/articles_features`).
+
+```bash
+# 1. build shared feature tables (needs data/processed from step 4)
+docker compose run --rm spark-app python src/analysis/build_features.py
+
+# 2. train a member's models (both tasks, or one of: classification / regression)
+docker compose run --rm spark-app python src/analysis/roman_models.py
+
+# 3. compare all trained models against trivial baselines
+docker compose run --rm spark-app python src/analysis/compare.py
+```
+
+Results are written to `output/ml/<member>/` (metrics, tuning tables, coefficients/importances, plots)
+and `output/ml/comparison/` (summary tables and charts).
+Shared helpers (split, preprocessing, tuning, metrics, saving) live in `src/analysis/common.py`.
+
 ---
 
 ## Two Modes of Work
