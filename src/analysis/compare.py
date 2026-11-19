@@ -75,6 +75,35 @@ def _bar_chart(table: pd.DataFrame, metrics, title: str):
     return fig
 
 
+def _curves_chart():
+    """ROC and precision-recall curves of all classifiers on one chart."""
+    files = sorted(f for f in glob.glob(os.path.join(OUTPUT_DIR, "*", "curves__classification__*.csv"))
+                   if os.sep + COMPARISON + os.sep not in f)
+    if not files:
+        return None
+    fig, (ax_roc, ax_pr) = plt.subplots(1, 2, figsize=(12, 5))
+    positive_rate = None
+    for path in files:
+        member = os.path.basename(os.path.dirname(path))
+        model = os.path.basename(path)[len("curves__classification__"):-len(".csv")]
+        curves = pd.read_csv(path)
+        roc = curves.sort_values(["fpr", "recall"])
+        pr = curves[curves["tp"] + curves["fp"] > 0].sort_values("recall")
+        ax_roc.plot(roc["fpr"], roc["recall"], label=f"{member}: {model}")
+        ax_pr.plot(pr["recall"], pr["precision"], label=f"{member}: {model}")
+        first = curves.iloc[0]
+        positive_rate = (first["tp"] + first["fn"]) / (first["tp"] + first["fn"] + first["fp"] + first["tn"])
+    ax_roc.plot([0, 1], [0, 1], color="grey", linestyle="--", label="random")
+    ax_pr.axhline(positive_rate, color="grey", linestyle="--", label="random")
+    ax_roc.set(xlabel="False positive rate", ylabel="True positive rate (recall)", title="ROC curves", xlim=(0, 1), ylim=(0, 1.02))
+    ax_pr.set(xlabel="Recall", ylabel="Precision", title="Precision-recall curves", xlim=(0, 1), ylim=(0, 1.02))
+    for ax in (ax_roc, ax_pr):
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8)
+    fig.suptitle("classification: all models on test")
+    return fig
+
+
 def main() -> None:
     results = pd.concat([_member_metrics(), _baselines()], ignore_index=True)
     for task, (metrics, sort_by) in DISPLAY.items():
@@ -88,6 +117,10 @@ def main() -> None:
         print(table.drop(columns=["params"], errors="ignore").to_string(index=False, float_format=lambda v: f"{v:.4f}"))
         chart_metrics = [m for m in metrics if m in table.columns and table[m].notna().any()]
         save_plot(_bar_chart(table.fillna(0), chart_metrics[:4], f"{task}: test metrics"), COMPARISON, f"{task}_comparison")
+
+    curves_fig = _curves_chart()
+    if curves_fig is not None:
+        save_plot(curves_fig, COMPARISON, "classification_roc_pr_curves")
 
 
 if __name__ == "__main__":

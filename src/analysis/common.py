@@ -411,10 +411,13 @@ def evaluate(predictions: DataFrame, task: str, threshold: Optional[float] = Non
     return regression_metrics(predictions)
 
 
-def best_threshold(predictions: DataFrame, step: float = 0.01) -> Tuple[float, pd.DataFrame]:
-    """Threshold on P(label=1) that maximises F1. Use it on the validation part,
-    never on test. Returns (threshold, table with precision/recall/f1 per threshold)."""
-    thresholds = [round(step * i, 4) for i in range(1, int(1 / step))]
+def threshold_table(predictions: DataFrame, step: float = 0.01) -> pd.DataFrame:
+    """Confusion matrix for every threshold on P(label=1), computed in one Spark aggregation.
+
+    Columns: threshold, tp, fp, fn, tn, precision, recall (= TPR), fpr, f1.
+    It is the data behind the ROC curve, the precision-recall curve and the threshold choice.
+    """
+    thresholds = [round(step * i, 6) for i in range(0, int(round(1 / step)) + 1)] + [1.0 + step]
     p1 = positive_probability()
     label = F.col(LABEL_COL)
     exprs = []
@@ -423,16 +426,27 @@ def best_threshold(predictions: DataFrame, step: float = 0.01) -> Tuple[float, p
             F.sum(((p1 >= t) & (label == 1)).cast("long")).alias(f"tp{i}"),
             F.sum(((p1 >= t) & (label == 0)).cast("long")).alias(f"fp{i}"),
         ]
-    exprs.append(F.sum((label == 1).cast("long")).alias("pos"))
+    exprs += [F.sum((label == 1).cast("long")).alias("pos"), F.sum((label == 0).cast("long")).alias("neg")]
     row = predictions.select(*exprs).collect()[0]
+    pos, neg = row["pos"] or 0, row["neg"] or 0
     records = []
     for i, t in enumerate(thresholds):
-        tp, fp, pos = row[f"tp{i}"] or 0, row[f"fp{i}"] or 0, row["pos"] or 0
-        precision = tp / (tp + fp) if tp + fp else 0.0
+        tp, fp = row[f"tp{i}"] or 0, row[f"fp{i}"] or 0
+        precision = tp / (tp + fp) if tp + fp else 1.0
         recall = tp / pos if pos else 0.0
         f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-        records.append({"threshold": t, "precision": precision, "recall": recall, "f1": f1})
-    table = pd.DataFrame(records)
+        records.append({
+            "threshold": t, "tp": tp, "fp": fp, "fn": pos - tp, "tn": neg - fp,
+            "precision": precision, "recall": recall, "fpr": fp / neg if neg else 0.0, "f1": f1,
+        })
+    return pd.DataFrame(records)
+
+
+def best_threshold(predictions: DataFrame, step: float = 0.01) -> Tuple[float, pd.DataFrame]:
+    """Threshold on P(label=1) that maximises F1. Use it on the validation part,
+    never on test. Returns (threshold, table with precision/recall/f1 per threshold)."""
+    table = threshold_table(predictions, step)
+    table = table[(table["threshold"] > 0) & (table["threshold"] < 1)].reset_index(drop=True)
     best = float(table.loc[table["f1"].idxmax(), "threshold"])
     return best, table
 
@@ -599,3 +613,93 @@ def weights_table(names: Sequence[str], values: Sequence[float], column: str = "
     table = pd.DataFrame({"feature": list(names), column: list(values)})
     table["abs"] = table[column].abs()
     return table.sort_values("abs", ascending=False).drop(columns="abs")
+
+
+# ---------------------------------------------------------------------------
+# Result analysis plots
+# ---------------------------------------------------------------------------
+
+def save_curves(member: str, model_name: str, predictions: DataFrame, step: float = 0.005) -> pd.DataFrame:
+    """ROC / PR curve points of a classifier on test -> output/ml/<member>/curves__classification__<model>.csv.
+    compare.py draws the curves of all models on one chart from these files."""
+    table = threshold_table(predictions, step)
+    save_table(table, member, f"curves__{CLASSIFICATION}__{model_name}")
+    return table
+
+
+def plot_roc_pr(curves: pd.DataFrame, metrics: Dict[str, float], title: str, threshold: Optional[float] = None):
+    """ROC curve and precision-recall curve side by side, with the chosen threshold marked."""
+    positive_rate = (metrics["tp"] + metrics["fn"]) / max(metrics["tp"] + metrics["fp"] + metrics["fn"] + metrics["tn"], 1)
+    roc = curves.sort_values(["fpr", "recall"])
+    pr = curves[curves["tp"] + curves["fp"] > 0].sort_values("recall")
+    fig, (ax_roc, ax_pr) = plt.subplots(1, 2, figsize=(11, 4.8))
+    ax_roc.plot(roc["fpr"], roc["recall"], label=f"model (AUC = {metrics.get('roc_auc', float('nan')):.3f})")
+    ax_roc.plot([0, 1], [0, 1], color="grey", linestyle="--", label="random (AUC = 0.5)")
+    ax_roc.set_xlabel("False positive rate")
+    ax_roc.set_ylabel("True positive rate (recall)")
+    ax_roc.set_title("ROC curve")
+    ax_pr.plot(pr["recall"], pr["precision"], label=f"model (AUC = {metrics.get('pr_auc', float('nan')):.3f})")
+    ax_pr.axhline(positive_rate, color="grey", linestyle="--", label=f"random (precision = {positive_rate:.3f})")
+    ax_pr.set_xlabel("Recall")
+    ax_pr.set_ylabel("Precision")
+    ax_pr.set_title("Precision-recall curve")
+    if threshold is not None:
+        point = curves.iloc[(curves["threshold"] - threshold).abs().argsort()[:1]].iloc[0]
+        ax_roc.scatter([point["fpr"]], [point["recall"]], color="#e76f51", zorder=3, label=f"threshold {threshold:.2f}")
+        ax_pr.scatter([point["recall"]], [point["precision"]], color="#e76f51", zorder=3, label=f"threshold {threshold:.2f}")
+    for ax in (ax_roc, ax_pr):
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1.02)
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8, loc="lower right" if ax is ax_roc else "upper right")
+    fig.suptitle(title)
+    return fig
+
+
+def plot_confusion(metrics: Dict[str, float], title: str):
+    """2x2 confusion matrix with counts and share of all test examples."""
+    cells = [[metrics["tn"], metrics["fp"]], [metrics["fn"], metrics["tp"]]]
+    total = max(sum(map(sum, cells)), 1)
+    fig, ax = plt.subplots(figsize=(4.8, 4.2))
+    ax.imshow(cells, cmap="Blues")
+    for i in range(2):
+        for j in range(2):
+            value = cells[i][j]
+            ax.text(j, i, f"{value:,}\n{value / total:.1%}", ha="center", va="center",
+                    color="white" if value > total / 3 else "black", fontsize=11)
+    ax.set_xticks([0, 1])
+    ax.set_xticklabels(["predicted 0", "predicted 1"])
+    ax.set_yticks([0, 1])
+    ax.set_yticklabels(["actual 0", "actual 1"])
+    ax.set_title(title)
+    return fig
+
+
+def regression_diagnostics(predictions: DataFrame, title: str, max_points: int = 50000):
+    """Predicted vs actual and the distribution of residuals (actual - predicted) on test."""
+    sample = predictions.select(LABEL_COL, "prediction")
+    total = sample.count()
+    if total > max_points:
+        sample = sample.sample(fraction=max_points / total, seed=SEED)
+    data = sample.toPandas()
+    residuals = data[LABEL_COL] - data["prediction"]
+    upper = float(data[LABEL_COL].quantile(0.995))
+
+    fig, (ax_fit, ax_res) = plt.subplots(1, 2, figsize=(11, 4.8))
+    ax_fit.scatter(data[LABEL_COL], data["prediction"], s=3, alpha=0.3)
+    ax_fit.plot([0, upper], [0, upper], color="grey", linestyle="--", label="ideal")
+    ax_fit.set_xlim(0, upper)
+    ax_fit.set_ylim(0, upper)
+    ax_fit.set_xlabel("actual")
+    ax_fit.set_ylabel("predicted")
+    ax_fit.set_title("Predicted vs actual")
+    ax_fit.legend()
+    low, high = residuals.quantile(0.005), residuals.quantile(0.995)
+    ax_res.hist(residuals[(residuals >= low) & (residuals <= high)], bins=80, color="#457b9d")
+    ax_res.axvline(0, color="grey", linestyle="--")
+    ax_res.set_xlabel("residual (actual - predicted), central 99% shown")
+    ax_res.set_title(f"Residuals: mean = {residuals.mean():.4f}, std = {residuals.std():.4f}")
+    for ax in (ax_fit, ax_res):
+        ax.grid(alpha=0.3)
+    fig.suptitle(title)
+    return fig

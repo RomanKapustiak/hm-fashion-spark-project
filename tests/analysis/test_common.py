@@ -16,6 +16,7 @@ from src.analysis.common import (
     feature_names,
     numeric_columns,
     regression_metrics,
+    threshold_table,
 )
 
 SPEC = DatasetSpec(
@@ -93,3 +94,15 @@ def test_logistic_regression_runs_on_prepared_features(tiny):
     prepared = build_preprocessing(SPEC, ["a", "b"], kind="linear", text_features=16).fit(tiny).transform(tiny)
     model = LogisticRegression(labelCol=LABEL_COL, maxIter=5).fit(prepared)
     assert classification_metrics(model.transform(prepared))["accuracy"] > 0.5
+
+
+def test_threshold_table_roc_endpoints(spark):
+    df = spark.createDataFrame(
+        [(1.0, Vectors.dense([0.2, 0.8])), (0.0, Vectors.dense([0.6, 0.4])), (1.0, Vectors.dense([0.7, 0.3]))],
+        StructType([StructField("label", DoubleType()), StructField("probability", VectorUDT())]),
+    )
+    table = threshold_table(df, step=0.1)
+    first, last = table.iloc[0], table.iloc[-1]
+    assert (first["recall"], first["fpr"]) == (1.0, 1.0)  # threshold 0: everything is positive
+    assert (last["recall"], last["fpr"]) == (0.0, 0.0)    # threshold > 1: nothing is positive
+    assert (table["tp"] + table["fn"] == 2).all() and (table["fp"] + table["tn"] == 1).all()

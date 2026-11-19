@@ -33,9 +33,13 @@ from src.analysis.common import (  # noqa: E402
     best_threshold,
     evaluate,
     params_to_dict,
+    plot_confusion,
+    plot_roc_pr,
     plot_top_weights,
     plot_tuning,
     prepare_data,
+    regression_diagnostics,
+    save_curves,
     save_metrics,
     save_plot,
     save_table,
@@ -89,11 +93,11 @@ def run_classification(spark: SparkSession) -> None:
               MEMBER, f"{task}__tuning")
 
     # 2. decision threshold: classes are imbalanced, so 0.5 is not optimal for F1
-    threshold, threshold_table = best_threshold(tuning.best_model.transform(data.valid))
-    save_table(threshold_table, MEMBER, f"threshold__{task}__{model_name}")
+    threshold, thresholds = best_threshold(tuning.best_model.transform(data.valid))
+    save_table(thresholds, MEMBER, f"threshold__{task}__{model_name}")
     fig, ax = plt.subplots(figsize=(7, 4))
     for column in ("precision", "recall", "f1"):
-        ax.plot(threshold_table["threshold"], threshold_table[column], label=column)
+        ax.plot(thresholds["threshold"], thresholds[column], label=column)
     ax.axvline(threshold, color="grey", linestyle="--", label=f"best = {threshold:.2f}")
     ax.set_xlabel("threshold on P(buy)")
     ax.set_title("LogisticRegression: metrics vs threshold (validation)")
@@ -116,7 +120,13 @@ def run_classification(spark: SparkSession) -> None:
     save_metrics(MEMBER, task, model_name, metrics, params_to_dict(tuning.best_params),
                  fit_seconds=seconds, threshold=threshold, num_features=len(data.feature_names))
 
-    # 5. interpretation: the largest coefficients (numeric features are standardized, categories are 0/1)
+    # 5. result analysis on test: ROC / precision-recall curves and the confusion matrix
+    curves = save_curves(MEMBER, model_name, predictions)
+    save_plot(plot_roc_pr(curves, metrics, "LogisticRegression on test", threshold), MEMBER, f"{task}__roc_pr")
+    save_plot(plot_confusion(metrics, f"LogisticRegression on test (threshold {threshold:.2f})"),
+              MEMBER, f"{task}__confusion_matrix")
+
+    # 6. interpretation: the largest coefficients (numeric features are standardized, categories are 0/1)
     coefficients = model.coefficients.toArray()
     save_table(weights_table(data.feature_names, coefficients, "coefficient"), MEMBER, f"coefficients__{task}")
     save_plot(plot_top_weights(data.feature_names, coefficients, "LogisticRegression: top coefficients"),
@@ -151,18 +161,10 @@ def run_regression(spark: SparkSession) -> None:
     save_metrics(MEMBER, task, model_name, metrics, params_to_dict(tuning.best_params),
                  fit_seconds=seconds, num_features=len(data.feature_names))
 
-    # predicted vs actual on test
-    sample = predictions.select(LABEL_COL, "prediction").toPandas()
-    fig, ax = plt.subplots(figsize=(5.5, 5.5))
-    ax.scatter(sample[LABEL_COL], sample["prediction"], s=3, alpha=0.3)
-    upper = float(sample[LABEL_COL].quantile(0.995))
-    ax.plot([0, upper], [0, upper], color="grey", linestyle="--")
-    ax.set_xlim(0, upper)
-    ax.set_ylim(0, upper)
-    ax.set_xlabel("actual average price")
-    ax.set_ylabel("predicted")
-    ax.set_title(f"LinearRegression on test: R2={metrics['r2']:.3f}")
-    save_plot(fig, MEMBER, f"{task}__predicted_vs_actual")
+    # result analysis on test: predicted vs actual and residuals
+    save_plot(regression_diagnostics(predictions, f"LinearRegression on test: R2 = {metrics['r2']:.3f}, "
+                                                  f"RMSE = {metrics['rmse']:.4f}"),
+              MEMBER, f"{task}__diagnostics")
 
     coefficients = model.coefficients.toArray()
     save_table(weights_table(data.feature_names, coefficients, "coefficient"), MEMBER, f"coefficients__{task}")
