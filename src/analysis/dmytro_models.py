@@ -1,16 +1,21 @@
 """Dmytro: gradient-boosted trees for both tasks.
 
 - classification: GBTClassifier  (will a customer buy within the next 4 weeks?)
-- regression:     GBTRegressor   (article price from its characteristics)
+- regression:     GBTRegressor   (article price from its characteristics, name and description)
 
 Run:
-    docker compose run --rm spark-app python src/analysis/dmytro_models.py [classification|regression]
+    docker compose run --rm spark-app python src/analysis/dmytro_models.py
+    docker compose run --rm spark-app python src/analysis/dmytro_models.py [classification|regression-text|regression]
+
+The default runs classification and regression with text. Use ``regression``
+to reproduce the no-text comparison.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+from functools import partial
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if PROJECT_ROOT not in sys.path:
@@ -54,6 +59,7 @@ MAX_DEPTHS = [3, 5]
 STEP_SIZES = [0.1, 0.2]
 MAX_ITER = {"classification": [20, 40], "regression": [20, 40]}
 SUBSAMPLING_RATE = 0.8
+TEXT_FEATURES = 256
 
 
 def _gbt_grid(estimator, task):
@@ -159,10 +165,14 @@ def run_classification(spark: SparkSession) -> None:
     data.unpersist()
 
 
-def run_regression(spark: SparkSession) -> None:
-    print("\n=== Gradient-boosted trees: article price from its characteristics ===")
-    task, model_name = ARTICLES.task, "gbt"
-    data = prepare_data(spark, ARTICLES, kind="tree")
+def run_regression(spark: SparkSession, *, include_text: bool = False) -> None:
+    variant = "with name and description" if include_text else "without text"
+    print(f"\n=== Gradient-boosted trees: article price ({variant}) ===")
+    task = ARTICLES.task
+    model_name = "gbt_text" if include_text else "gbt"
+    artifact_prefix = f"{task}_text" if include_text else task
+    title = f"GBTRegressor ({variant})"
+    data = prepare_data(spark, ARTICLES, kind="tree", include_text=include_text, text_features=TEXT_FEATURES)
 
     # maxBins >= number of categories (248 departments), otherwise Spark fails
     estimator = GBTRegressor(featuresCol=FEATURES_COL, labelCol=LABEL_COL,
@@ -171,16 +181,16 @@ def run_regression(spark: SparkSession) -> None:
     tuning = tune(estimator, _gbt_grid(estimator, task), data.fit, data.valid, task)
     save_table(tuning.table, MEMBER, f"tuning__{task}__{model_name}")
     save_plot(plot_tuning(_best_iter_table(tuning, estimator), "maxDepth", tuning.metric, hue="stepSize",
-                          title="GBTRegressor: RMSE vs depth"),
-              MEMBER, f"{task}__tuning")
+                          title=f"{title}: RMSE vs depth"),
+              MEMBER, f"{artifact_prefix}__tuning")
 
     candidate = tuning.best_model
     if not isinstance(candidate, GBTRegressionModel):
         raise TypeError("Expected a fitted GBT regressor")
     curve = _iteration_curve(candidate, data.fit, data.valid, loss="squared")
     save_table(curve, MEMBER, f"iterations__{task}__{model_name}")
-    save_plot(_plot_iterations(curve, "GBTRegressor: squared error by iteration", "squared error"),
-              MEMBER, f"{task}__iterations")
+    save_plot(_plot_iterations(curve, f"{title}: squared error by iteration", "squared error"),
+              MEMBER, f"{artifact_prefix}__iterations")
 
     model, seconds = timed_fit(estimator, data.train, tuning.best_params)
     print(f"final fit: {seconds:.1f}s, {model.getNumTrees} trees")
@@ -193,21 +203,25 @@ def run_regression(spark: SparkSession) -> None:
                  fit_seconds=seconds, num_features=len(data.feature_names))
 
     # result analysis on test: predicted vs actual and residuals
-    save_plot(regression_diagnostics(predictions, f"GBTRegressor on test: R2 = {metrics['r2']:.3f}, "
+    save_plot(regression_diagnostics(predictions, f"{title} on test: R2 = {metrics['r2']:.3f}, "
                                                   f"RMSE = {metrics['rmse']:.4f}"),
-              MEMBER, f"{task}__diagnostics")
+              MEMBER, f"{artifact_prefix}__diagnostics")
 
     importances = model.featureImportances.toArray()
-    save_table(weights_table(data.feature_names, importances, "importance"), MEMBER, f"importances__{task}")
-    save_plot(plot_top_weights(data.feature_names, importances, "GBTRegressor: feature importances"),
-              MEMBER, f"{task}__importances")
+    save_table(weights_table(data.feature_names, importances, "importance"), MEMBER, f"importances__{artifact_prefix}")
+    save_plot(plot_top_weights(data.feature_names, importances, f"{title}: feature importances"),
+              MEMBER, f"{artifact_prefix}__importances")
     data.unpersist()
 
 
-TASKS = {"classification": run_classification, "regression": run_regression}
+TASKS = {
+    "classification": run_classification,
+    "regression": run_regression,
+    "regression-text": partial(run_regression, include_text=True),
+}
 
 if __name__ == "__main__":
-    selected = sys.argv[1:] or list(TASKS)
+    selected = sys.argv[1:] or ["classification", "regression-text"]
     session = create_spark_session("HM-Models-Dmytro")
     try:
         for name in selected:
