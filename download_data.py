@@ -45,6 +45,11 @@ def download_file(api: KaggleApi, file_name: str, dest: Path) -> None:
         force=False,
     )
 
+    # Newer API versions save the zip archive under the plain <file_name> (e.g. a
+    # "transactions_train.csv" that is really a zip): rename it so it is extracted below.
+    if not zip_path.exists() and (dest / file_name).exists() and zipfile.is_zipfile(dest / file_name):
+        (dest / file_name).rename(zip_path)
+
     # The API saves the file as <file_name>.zip
     if zip_path.exists():
         print(f"[2/3] Extracting {zip_path.name} ...")
